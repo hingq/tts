@@ -18,6 +18,7 @@
 - [ ] 编写 `GET /api/v1/audiobook/jobs/:jobId/events` 接口 (测试 SSE 实时进度推送流)
 - [ ] 编写 `GET /api/v1/audiobook/jobs/:jobId/file` 接口 (支持 Range 响应的流式下载)
 - [ ] 编写 `DELETE /api/v1/audiobook/jobs/:jobId` 接口 (强杀该任务的子进程并移除目录)
+- [ ] 编写 `POST /api/v1/audiobook/jobs/:jobId/resume` 接口 (恢复暂停或失败的任务)
 - [ ] 编写服务优雅停机处理机制 (监听 SIGTERM/SIGINT，停止新连接，保存当前运行进度)
 
 ## 3. 文本清洗与切片模块 (Text Preprocessor & Splitter)

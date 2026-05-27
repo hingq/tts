@@ -162,6 +162,19 @@ export class JobManager extends EventEmitter {
     this.emit(`job:${jobId}`, job);
     return true;
   }
+
+  public resumeJob(jobId: string): boolean {
+    const job = this.jobs.get(jobId);
+    if (!job) return false;
+    if (['running', 'done'].includes(job.status)) return false;
+
+    job.status = 'pending';
+    job.error = null;
+    this.jobs.set(jobId, job);
+    this.startMockWorkflow(jobId);
+    this.emit(`job:${jobId}`, job);
+    return true;
+  }
 }
 ```
 
@@ -308,6 +321,16 @@ start();
 * **逻辑**：
   - 调用 `JobManager.getInstance().cancelJob(jobId)`。
   - 成功则返回 `204 No Content`，不存在则返回 `404 Not Found`。
+
+---
+
+### 2.4.6 `POST /api/v1/audiobook/jobs/:jobId/resume`
+* **功能**：恢复暂停或失败的任务。
+* **逻辑**：
+  - 检查任务是否存在。如果临时目录或 `state.json` 不存在，返回 `404 Not Found`。
+  - 检查状态，如果已在运行或已完成，返回 `400 Bad Request`。
+  - 调用 `JobManager.getInstance().resumeJob(jobId)` 将任务状态设为 `pending` 并重新入队。
+  - 成功则返回 `200 OK` 及更新后的 `JobInfo`。
 
 ---
 

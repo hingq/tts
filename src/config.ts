@@ -1,0 +1,109 @@
+/**
+ * @file config.ts
+ * @description 有声书生成服务的全局配置管理模块，负责从环境变量读取参数，执行类型安全转换，并设定合理的默认值。
+ * 并在初始化时自动校验并递归创建临时工作目录。
+ */
+
+import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+
+// 加载环境变量
+dotenv.config();
+
+/**
+ * 全局配置接口定义
+ */
+export interface Config {
+  /** 服务监听端口 */
+  PORT: number;
+  /** 服务绑定主机地址 */
+  HOST: string;
+  /** 临时工作空间根目录绝对路径 */
+  TMP_ROOT: string;
+  /** 允许上传的最大文本体积（单位: MB） */
+  MAX_TEXT_SIZE_MB: number;
+  /** 全局最大并发运行任务数 */
+  MAX_CONCURRENT_JOBS: number;
+  /** 微软 Edge TTS 引擎的并发请求上限 */
+  CONCURRENT_TTS_LIMIT: number;
+  /** FFmpeg 转码的并发线程上限 */
+  CONCURRENT_TRANSCODE_LIMIT: number;
+  /** 默认的语音合成引擎（如 'edge-tts'） */
+  DEFAULT_TTS_ENGINE: string;
+  /** 单个子进程（如转码）执行的超时时间（单位: 毫秒） */
+  SUBPROCESS_TIMEOUT_MS: number;
+  /** 整个有声书生成任务的全局超时时间（单位: 毫秒） */
+  GLOBAL_TASK_TIMEOUT_MS: number;
+  /** 合成语音请求时使用的 HTTP 代理网关地址（可选） */
+  TTS_PROXY?: string;
+  /** FFmpeg 可执行二进制文件的系统路径 */
+  FFMPEG_PATH: string;
+  /** FFprobe 可执行二进制文件的系统路径 */
+  FFPROBE_PATH: string;
+}
+
+/**
+ * 安全解析数字类型的环境变量，如果非法或不存在则返回指定的默认值。
+ *
+ * @param envVal 环境变量的原始字符串值
+ * @param defaultValue 当值缺失或无法解析时采用的默认数值
+ * @returns 解析得到的安全整数数值
+ */
+function parseNumber(envVal: string | undefined, defaultValue: number): number {
+  if (envVal === undefined) return defaultValue;
+  const num = parseInt(envVal, 10);
+  return isNaN(num) ? defaultValue : num;
+}
+
+// 解析临时根目录，如果环境变量未定义，则默认使用系统的临时文件夹下的 audiobook 子目录
+const rawTmpRoot = process.env.TMP_ROOT || path.join(os.tmpdir(), 'audiobook');
+const absoluteTmpRoot = path.resolve(rawTmpRoot);
+
+// 自动初始化工作根目录：在模块加载时同步检查并创建，确保后续文件写入操作的畅通（Fail-fast 机制）
+if (!fs.existsSync(absoluteTmpRoot)) {
+  try {
+    fs.mkdirSync(absoluteTmpRoot, { recursive: true });
+  } catch (error) {
+    // 捕获目录创建异常并打印详细的诊断信息，以便排查权限等问题
+    // eslint-disable-next-line no-console
+    console.error(`Failed to initialize TMP_ROOT directory at ${absoluteTmpRoot}:`, error);
+    throw error;
+  }
+}
+
+/**
+ * 全局只读配置对象实例
+ */
+export const config: Config = {
+  // 服务监听端口，默认 3000
+  PORT: parseNumber(process.env.PORT, 3000),
+  // 服务绑定主机，默认 127.0.0.1
+  HOST: process.env.HOST || '127.0.0.1',
+  // 临时工作空间根目录，已解析为绝对路径并在初始化时自动递归创建
+  TMP_ROOT: absoluteTmpRoot,
+  // 单次任务允许上传的最大文本体积（单位: MB），默认 5
+  MAX_TEXT_SIZE_MB: parseNumber(process.env.MAX_TEXT_SIZE_MB, 5),
+  // 全局最大并发运行任务数，默认 2
+  MAX_CONCURRENT_JOBS: parseNumber(process.env.MAX_CONCURRENT_JOBS, 2),
+  // 微软 Edge TTS 引擎的并发请求上限，默认 2
+  CONCURRENT_TTS_LIMIT: parseNumber(process.env.CONCURRENT_TTS_LIMIT, 2),
+  // FFmpeg 转码并发线程数上限，默认使用 CPU 核心数减一
+  CONCURRENT_TRANSCODE_LIMIT: parseNumber(
+    process.env.CONCURRENT_TRANSCODE_LIMIT,
+    Math.max(1, os.cpus().length - 1),
+  ),
+  // 默认的语音合成引擎，默认使用 edge-tts
+  DEFAULT_TTS_ENGINE: process.env.DEFAULT_TTS_ENGINE || 'edge-tts',
+  // 单个子进程（如转码）执行超时时间（单位: 毫秒），默认 60000（1分钟）
+  SUBPROCESS_TIMEOUT_MS: parseNumber(process.env.SUBPROCESS_TIMEOUT_MS, 60000),
+  // 整个有声书生成任务全局超时时间（单位: 毫秒），默认 3600000（1小时）
+  GLOBAL_TASK_TIMEOUT_MS: parseNumber(process.env.GLOBAL_TASK_TIMEOUT_MS, 3600000),
+  // 合成语音请求时使用的 HTTP 代理网关地址，非必填
+  TTS_PROXY: process.env.TTS_PROXY || undefined,
+  // FFmpeg 可执行二进制路径，默认 'ffmpeg'
+  FFMPEG_PATH: process.env.FFMPEG_PATH || 'ffmpeg',
+  // FFprobe 可执行二进制路径，默认 'ffprobe'
+  FFPROBE_PATH: process.env.FFPROBE_PATH || 'ffprobe',
+};

@@ -7,17 +7,23 @@ This document outlines the design and implementation tasks to build a Fastify + 
 ## User Review Required
 
 > [!IMPORTANT]
-> **Key Architectural Decisions & Requirements:**
-> 1. **No External DB / State Store**: The service uses a simple filesystem-based `state.json` inside each task's directory for check-pointing and state restoration upon reboot.
-> 2. **Security Considerations (FFmpeg & File IO)**: FFmpeg will be spawned using `spawn`. The input files and paths will be carefully validated and sanitized. Input parameters like title, author, voice, etc., will be validated against strict regex/allow-lists before passing to command line parameters to prevent Shell Injection.
-> 3. **Proxy Configuration**: Edge-TTS will use HTTP/HTTPS/Socks proxy configurations if `TTS_PROXY` is defined.
-> 4. **Code Comments**: 为所有的核心逻辑、复杂算法（如文本切片、中文数字转换、FFmpeg命令映射、双池并发队列等）以及重要的函数编写清晰的注释，以增强代码的可读性与后期维护性。
+> **Key Architectural Decisions & Finalized Design Choices:**
+> 1. **No External DB / State Store**: The service uses a simple filesystem-based `state.json` inside each task's directory for check-pointing and state restoration.
+> 2. **Zero-Tolerance Retry & Resume**: A job fails if a chunk fails after 3 retries, but users can manually resume from the checkpoint using the Resume API.
+> 3. **Immediate Cleanup**: The job directory and output files are deleted immediately after a successful full download to maximize disk space efficiency.
+> 4. **Voice Whitelist**: Strictly restricted to core mainland Mandarin voices (`zh-CN-YunxiNeural`, `zh-CN-XiaoxiaoNeural`, `zh-CN-YunjianNeural`).
+> 5. **Runtime-Only FFmpeg Check**: FFmpeg/FFprobe availability is checked on-demand during task run, not on server startup.
+> 6. **Proportional Disk Space Pre-check**: Expected peak disk space scales dynamically based on requested bitrate (128k -> 2.0x, 32k -> 0.5x, 64k -> 1.0x).
+> 7. **FFmpeg Transcode Thread Limit**: Added `-threads 1` to the per-chunk transcode command to optimize CPU resource allocation.
+> 8. **Boot Recovery in Paused State**: On server startup, recovered jobs are loaded in `paused` state and require a manual resume call.
+> 9. **Upload File Validation**: Strict validation of MIME-types and file extensions for both text (`.txt`, `text/plain`) and cover (`.jpg`/`.jpeg`/`.png`, `image/jpeg`/`image/png`).
+> 10. **Code Comments**: Rich Chinese comments and JSDoc for all core files, complex split algorithms, and concurrency pools.
 
 ---
 
 ## Open Questions
 
-None at the moment. Please review the task breakdown below and approve.
+None. All architectural decisions have been discussed and aligned with the user.
 
 ---
 
@@ -87,11 +93,12 @@ FFmpeg wrapper:
 
 #### [NEW] [jobs.ts](file:///Users/he/projects/tts/src/routes/jobs.ts)
 Fastify route handlers:
-- `POST /api/v1/audiobook/jobs` (receives multipart upload, validates fields).
+- `POST /api/v1/audiobook/jobs` (receives multipart upload, strictly validates files/params, returns 503 if global limit is reached).
 - `GET /api/v1/audiobook/jobs/:jobId` (checks progress/status).
+- `POST /api/v1/audiobook/jobs/:jobId/resume` (resumes a paused or failed task; returns 404 if state files are missing, 400 if already running).
 - `GET /api/v1/audiobook/jobs/:jobId/events` (SSE endpoint for real-time progress).
-- `GET /api/v1/audiobook/jobs/:jobId/file` (pipes final M4B, supports range/resume, marks as downloaded).
-- `DELETE /api/v1/audiobook/jobs/:jobId` (cancels running job).
+- `GET /api/v1/audiobook/jobs/:jobId/file` (pipes final M4B, supports range/resume, deletes the job workspace directory immediately upon successful full download stream close).
+- `DELETE /api/v1/audiobook/jobs/:jobId` (cancels running job, terminates subprocesses, and cleans up directory).
 
 #### [NEW] [server.ts](file:///Users/he/projects/tts/src/server.ts)
 Fastify server configuration, plugin registration, custom error handlers, and listening port setup (localhost-only for testing, configurably bound for production). Graceful shutdown hook listener (`SIGTERM`/`SIGINT`) to clean up subprocesses and save checkpoints.
