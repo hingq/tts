@@ -15,7 +15,7 @@ This document outlines the design and implementation tasks to build a Fastify + 
 > 5. **Runtime-Only FFmpeg Check**: FFmpeg/FFprobe availability is checked on-demand during task run, not on server startup.
 > 6. **Proportional Disk Space Pre-check**: Expected peak disk space scales dynamically based on requested bitrate (128k -> 2.0x, 32k -> 0.5x, 64k -> 1.0x).
 > 7. **FFmpeg Transcode Thread Limit**: Added `-threads 1` to the per-chunk transcode command to optimize CPU resource allocation.
-> 8. **Boot Recovery in Paused State**: On server startup, recovered jobs are loaded in `paused` state and require a manual resume call.
+> 8. **Boot Recovery (No Paused State)**: On server startup, recovered unfinished jobs are marked `failed` (no `paused` state is introduced) and require a manual resume call to re-enqueue.
 > 9. **Upload File Validation**: Strict validation of MIME-types and file extensions for both text (`.txt`, `text/plain`) and cover (`.jpg`/`.jpeg`/`.png`, `image/jpeg`/`image/png`).
 > 10. **Code Comments**: Rich Chinese comments and JSDoc for all core files, complex split algorithms, and concurrency pools.
 
@@ -95,7 +95,7 @@ FFmpeg wrapper:
 Fastify route handlers:
 - `POST /api/v1/audiobook/jobs` (receives multipart upload, strictly validates files/params, returns 503 if global limit is reached).
 - `GET /api/v1/audiobook/jobs/:jobId` (checks progress/status).
-- `POST /api/v1/audiobook/jobs/:jobId/resume` (resumes a paused or failed task; returns 404 if state files are missing, 400 if already running).
+- `POST /api/v1/audiobook/jobs/:jobId/resume` (resumes a failed/canceled task; 404 if missing, 400 if pending/running/done, 503 if concurrency limit reached).
 - `GET /api/v1/audiobook/jobs/:jobId/events` (SSE endpoint for real-time progress).
 - `GET /api/v1/audiobook/jobs/:jobId/file` (pipes final M4B, supports range/resume, deletes the job workspace directory immediately upon successful full download stream close).
 - `DELETE /api/v1/audiobook/jobs/:jobId` (cancels running job, terminates subprocesses, and cleans up directory).
