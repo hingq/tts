@@ -256,7 +256,7 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
    * 事件流：handshake → ai-stream* → ai-complete。
    * 复用与 /jobs/:jobId/events 相同的 cleanup + heartbeat 模式。
    */
-  fastify.get('/see', async (request, reply) => {
+  fastify.get('/sse', async (request, reply) => {
     const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
     const MOCK_TEXT =

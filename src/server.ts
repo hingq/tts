@@ -8,7 +8,6 @@ import Fastify from 'fastify';
 import multipart from '@fastify/multipart';
 import { FastifySSEPlugin } from 'fastify-sse-v2';
 import { config } from './config.js';
-import { registerRoutes } from './routes/jobs.js';
 import { JobManager } from './services/job-manager.js';
 
 const fastify = Fastify({
@@ -62,7 +61,9 @@ async function bootstrap(): Promise<void> {
   await fastify.register(FastifySSEPlugin);
 
   // 注册业务 API 路由
-  await fastify.register(registerRoutes, { prefix: '/api/v1/audiobook' });
+  // 动态导入路由插件，配合 build.js 的 splitting:true 将路由层拆为独立 chunk
+  const { registerRoutes } = await import('./routes/jobs.js');
+  await fastify.register(registerRoutes, { prefix: '/api/v1' });
 }
 
 /**
@@ -97,7 +98,17 @@ const start = async (): Promise<void> => {
   }
 };
 
-process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => {
+  console.log('等待关闭');
+
+  void gracefulShutdown('SIGTERM');
+  console.log('⚡️关闭成功');
+});
+process.on('SIGINT', () => {
+  console.log('等待关闭');
+
+  void gracefulShutdown('SIGINT');
+  console.log('⚡️关闭成功');
+});
 
 start();

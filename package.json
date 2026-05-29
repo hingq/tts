@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "node build.mjs",
+    "build": "node build.js",
     "start": "node dist/server.js",
     "test": "vitest run",
     "lint": "eslint src/**/*.ts",
