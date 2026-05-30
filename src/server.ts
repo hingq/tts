@@ -9,6 +9,7 @@ import multipart from '@fastify/multipart';
 import { FastifySSEPlugin } from 'fastify-sse-v2';
 import { config } from './config.js';
 import { JobManager } from './services/job-manager.js';
+import { startGarbageCollector } from './services/gc.js';
 
 const fastify = Fastify({
   logger: {
@@ -21,6 +22,9 @@ const fastify = Fastify({
 
 /** 优雅停机期间健康检查反转的开关。 */
 let shuttingDown = false;
+
+/** 定时垃圾回收器句柄；启动后赋值，停机时清理。 */
+let gcTimer: NodeJS.Timeout | undefined;
 
 /**
  * 统一错误处理器：把未捕获异常归一为 { error, message } 响应体（契约见 plan.md 4.1）。
@@ -75,7 +79,8 @@ async function gracefulShutdown(signal: string): Promise<void> {
   shuttingDown = true;
   try {
     await fastify.close(); // 拒绝新连接，等待 in-flight 请求结束
-    JobManager.getInstance().clearAllTimers(); // Mock 阶段收尾：清除全部定时器
+    if (gcTimer) clearInterval(gcTimer); // 停止定时垃圾回收
+    JobManager.getInstance().clearAllTimers(); // 收尾：清理任务管理器资源
     process.exit(0);
   } catch (err) {
     fastify.log.error(err);
@@ -87,8 +92,10 @@ async function gracefulShutdown(signal: string): Promise<void> {
 const start = async (): Promise<void> => {
   try {
     await bootstrap();
-    // 自动扫描 TMP_ROOT 执行未完成任务恢复（Mock 阶段为空）
+    // 自动扫描 TMP_ROOT，恢复未完成任务并断点续传
     await JobManager.getInstance().recoverJobs();
+    // 启动定时垃圾回收，清理过期工作目录
+    gcTimer = startGarbageCollector();
 
     await fastify.listen({ port: config.PORT, host: config.HOST });
     fastify.log.info(`Server is listening on http://${config.HOST}:${config.PORT}`);

@@ -10,10 +10,9 @@ import '@fastify/multipart';
 import 'fastify-sse-v2';
 import fs from 'node:fs';
 import path from 'node:path';
-import { JobManager } from '../services/job-manager.js';
+import { JobManager, JobCreationError } from '../services/job-manager.js';
 import { JobInfo } from '../types/job.js';
 import { config } from '../config.js';
-import { json } from 'node:stream/consumers';
 
 /** 合法发音人白名单（核心普通话音色）。 */
 const VOICE_WHITELIST = ['zh-CN-YunxiNeural', 'zh-CN-XiaoxiaoNeural', 'zh-CN-YunjianNeural'];
@@ -50,9 +49,18 @@ async function drainAndCount(stream: AsyncIterable<Buffer>): Promise<number> {
   return bytes;
 }
 
+/** 收集一个可读流的全部字节为 Buffer（文本体积受 multipart fileSize 限制保护）。 */
+async function collectBuffer(stream: AsyncIterable<Buffer>): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
 interface ParsedUpload {
   fields: Record<string, string>;
   hasText: boolean;
+  /** 上传的正文文本字节，供真实流水线预处理；非法或缺失时为 null */
+  textBuffer: Buffer | null;
 }
 
 /**
@@ -62,6 +70,7 @@ interface ParsedUpload {
 async function parseAndValidate(request: FastifyRequest): Promise<ParsedUpload> {
   const fields: Record<string, string> = {};
   let hasText = false;
+  let textBuffer: Buffer | null = null;
 
   for await (const part of request.parts()) {
     if (part.type === 'file') {
@@ -71,7 +80,8 @@ async function parseAndValidate(request: FastifyRequest): Promise<ParsedUpload> 
           await drainAndCount(part.file); // 必须排干，避免连接挂起
           throw new HttpError(400, 'Bad Request', 'text 必须是 text/plain 的 .txt 文件');
         }
-        await drainAndCount(part.file); // 大小超限由 multipart 抛 413
+        // 收集正文字节供后续流水线预处理；大小超限由 multipart 抛 413
+        textBuffer = await collectBuffer(part.file);
         hasText = true;
       } else if (part.fieldname === 'cover') {
         const okMime = part.mimetype === 'image/jpeg' || part.mimetype === 'image/png';
@@ -91,7 +101,7 @@ async function parseAndValidate(request: FastifyRequest): Promise<ParsedUpload> 
     }
   }
 
-  return { fields, hasText };
+  return { fields, hasText, textBuffer };
 }
 
 /**
@@ -162,13 +172,13 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     }
 
     try {
-      const { fields, hasText } = await parseAndValidate(request);
-      if (!hasText) throw new HttpError(400, 'Bad Request', 'text 文件为必填项');
+      const { fields, hasText, textBuffer } = await parseAndValidate(request);
+      if (!hasText || !textBuffer) throw new HttpError(400, 'Bad Request', 'text 文件为必填项');
       const params = buildJobParams(fields);
 
-      // TODO(模块06): 此处需按预估峰值空间做磁盘预检，不足返回 507。
-
-      const job = manager.createMockJob(params); // 内部 releaseSlot 并转为真实计数
+      // 真实创建：内部做文本预处理、磁盘预检（不足抛 507）、落盘并后台跑流水线。
+      // createJob 内部 releaseSlot 并转为真实计数。
+      const job = await manager.createJob(params, textBuffer);
       return reply.code(201).send({
         jobId: job.jobId,
         statusUrl: `/api/v1/audiobook/jobs/${job.jobId}`,
@@ -177,6 +187,10 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     } catch (err) {
       manager.releaseSlot();
       if (err instanceof HttpError) {
+        return reply.code(err.statusCode).send({ error: err.publicName, message: err.message });
+      }
+      // 任务创建期错误（如文本为空 400、磁盘不足 507）按其携带的状态码映射
+      if (err instanceof JobCreationError) {
         return reply.code(err.statusCode).send({ error: err.publicName, message: err.message });
       }
       throw err; // 交由全局错误处理器（含 multipart 413）
@@ -365,14 +379,14 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       return reply.send(stream); // 部分下载不清理目录
     }
 
-    // 完整下载（连接关闭）后异步清理工作目录。
-    // 注意：仅在完整 200 下载后清理；部分 206（Range）请求可能是断点续传的一段，不可删除。
-    const cleanupDir = (): void => {
-      fs.rm(path.join(config.TMP_ROOT, jobId), { recursive: true, force: true }, () => undefined);
+    // 完整下载（连接关闭）后写入 `.downloaded` 标记，交由定时 GC 异步回收工作目录。
+    // 注意：仅在完整 200 下载后标记；部分 206（Range）请求可能是断点续传的一段，不可标记。
+    const markDownloaded = (): void => {
+      fs.writeFile(path.join(config.TMP_ROOT, jobId, '.downloaded'), '', () => undefined);
     };
     reply.header('Content-Length', size);
     const stream = fs.createReadStream(filePath);
-    reply.raw.on('close', cleanupDir);
+    reply.raw.on('close', markDownloaded);
     return reply.send(stream);
   });
 
