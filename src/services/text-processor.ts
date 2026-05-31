@@ -112,9 +112,11 @@ export function detectChapters(text: string): Chapter[] {
   CHAPTER_REGEX.lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = CHAPTER_REGEX.exec(text)) !== null) {
+    const fullMatch = match[0];
+    const leadingWhitespaceLength = fullMatch.length - fullMatch.trimStart().length;
     candidates.push({
-      title: match[0].trim(), // 完整匹配行（去除首尾空白）
-      index: match.index, // 匹配在全文中的字符偏移
+      title: fullMatch.trim(), // 完整匹配行（去除首尾空白）
+      index: match.index + leadingWhitespaceLength, // 匹配在全文中的真实字符偏移（排除前面的空白）
       matchedKeyword: match[1], // 捕获组：章节关键词部分（如 "第一章"、"序章"）
     });
   }

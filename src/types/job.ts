@@ -42,6 +42,8 @@ export interface ChunkState {
   index: number;
   /** 所属章节序号（从 0 开始） */
   chapterIndex: number;
+  /** 所属章节标题（可选） */
+  chapterTitle?: string;
   /** 待合成的纯文本 */
   text: string;
   /** 临时 MP3 的绝对路径（TTS 输出，转码完成后删除） */

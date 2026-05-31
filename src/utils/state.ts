@@ -15,27 +15,42 @@ import type { JobState } from '../types/job.js';
 /** 工作目录下状态文件的固定名称。 */
 const STATE_FILENAME = 'state.json';
 
+const writeQueues = new Map<string, Promise<void>>();
+
 /**
  * 原子化持久化任务状态。
  *
- * 步骤：
- * 1. 刷新 `updatedAt` 为当前 ISO 时间（每次落盘都更新，便于 GC 据此判断超期）。
- * 2. 序列化为带缩进的 JSON 写入临时文件 `state.json.tmp`。
- * 3. `fs.rename` 原子替换为 `state.json`——若第 2 步中途崩溃，损坏内容至多停留在 `.tmp`，
- *    既有 `state.json` 保持完整。
+ * 采用队列化串行写入以解决高并发时产生的临时文件竞态冲突问题。
  *
  * @param jobDir 任务工作目录的绝对路径
  * @param state 待持久化的任务状态（其 `updatedAt` 会被原地刷新）
  */
-export async function saveJobState(jobDir: string, state: JobState): Promise<void> {
+export function saveJobState(jobDir: string, state: JobState): Promise<void> {
   state.updatedAt = new Date().toISOString();
   const filePath = path.join(jobDir, STATE_FILENAME);
   const tmpPath = `${filePath}.tmp`;
 
-  // 先写临时文件——失败或崩溃不会污染既有的 state.json
-  await fs.writeFile(tmpPath, JSON.stringify(state, null, 2), 'utf-8');
-  // 原子替换：rename 同盘原子，杜绝半写损坏
-  await fs.rename(tmpPath, filePath);
+  const currentQueue = writeQueues.get(jobDir) || Promise.resolve();
+  const nextQueue = currentQueue.then(async () => {
+    try {
+      await fs.writeFile(tmpPath, JSON.stringify(state, null, 2), 'utf-8');
+      await fs.rename(tmpPath, filePath);
+    } catch (err) {
+      // 这里的错误需要继续往上抛，以便外部调用方感知写入失败
+      throw err;
+    }
+  });
+
+  writeQueues.set(jobDir, nextQueue);
+
+  // 执行完毕后清理 Map 键值，避免内存泄漏
+  nextQueue.finally(() => {
+    if (writeQueues.get(jobDir) === nextQueue) {
+      writeQueues.delete(jobDir);
+    }
+  });
+
+  return nextQueue;
 }
 
 /**

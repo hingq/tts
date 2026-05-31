@@ -169,7 +169,12 @@ export class JobManager extends EventEmitter {
    * @returns 新建任务的初始 {@link JobInfo}
    * @throws {JobCreationError} 文本为空（400）或磁盘空间不足（507）
    */
-  public async createJob(params: CreateJobParams, text: Buffer): Promise<JobInfo> {
+  public async createJob(
+    params: CreateJobParams,
+    text: Buffer,
+    cover?: Buffer,
+    coverExtension?: string,
+  ): Promise<JobInfo> {
     const jobId = randomUUID();
     const jobDir = path.join(config.TMP_ROOT, jobId);
 
@@ -185,6 +190,16 @@ export class JobManager extends EventEmitter {
     if (!(await verifyDiskSpace(jobDir, ttsChunks.length))) {
       fs.rmSync(jobDir, { recursive: true, force: true });
       throw new JobCreationError(507, 'Insufficient Storage', '磁盘可用空间不足以容纳本次任务');
+    }
+
+    // 保存封面图片（如果存在）
+    if (cover && coverExtension) {
+      try {
+        fs.writeFileSync(path.join(jobDir, `cover${coverExtension}`), cover);
+      } catch (error) {
+        fs.rmSync(jobDir, { recursive: true, force: true });
+        throw new JobCreationError(500, 'Internal Server Error', '保存封面图片失败');
+      }
     }
 
     // 校验通过、确定创建：把预留名额转为真实 job 计数
@@ -208,6 +223,7 @@ export class JobManager extends EventEmitter {
       chunks: ttsChunks.map((c) => ({
         index: c.index,
         chapterIndex: c.chapterIndex,
+        chapterTitle: c.chapterTitle,
         text: c.text,
         rawPath: path.join(jobDir, `raw_${c.index}.mp3`),
         m4aPath: path.join(jobDir, `chunk_${c.index}.m4a`),

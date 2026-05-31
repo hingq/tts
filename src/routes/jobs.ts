@@ -61,6 +61,8 @@ interface ParsedUpload {
   hasText: boolean;
   /** 上传的正文文本字节，供真实流水线预处理；非法或缺失时为 null */
   textBuffer: Buffer | null;
+  coverBuffer: Buffer | null;
+  coverExtension: string | null;
 }
 
 /**
@@ -71,6 +73,8 @@ async function parseAndValidate(request: FastifyRequest): Promise<ParsedUpload> 
   const fields: Record<string, string> = {};
   let hasText = false;
   let textBuffer: Buffer | null = null;
+  let coverBuffer: Buffer | null = null;
+  let coverExtension: string | null = null;
 
   for await (const part of request.parts()) {
     if (part.type === 'file') {
@@ -78,7 +82,7 @@ async function parseAndValidate(request: FastifyRequest): Promise<ParsedUpload> 
       if (part.fieldname === 'text') {
         if (part.mimetype !== 'text/plain' || ext !== '.txt') {
           await drainAndCount(part.file); // 必须排干，避免连接挂起
-          throw new HttpError(400, 'Bad Request', 'text 必须是 text/plain 的 .txt 文件');
+          throw new HttpError(400, 'Bad Request', 'text 必须 be text/plain 的 .txt 文件');
         }
         // 收集正文字节供后续流水线预处理；大小超限由 multipart 抛 413
         textBuffer = await collectBuffer(part.file);
@@ -86,13 +90,15 @@ async function parseAndValidate(request: FastifyRequest): Promise<ParsedUpload> 
       } else if (part.fieldname === 'cover') {
         const okMime = part.mimetype === 'image/jpeg' || part.mimetype === 'image/png';
         const okExt = ['.jpg', '.jpeg', '.png'].includes(ext);
-        const bytes = await drainAndCount(part.file);
         if (!okMime || !okExt) {
+          await drainAndCount(part.file);
           throw new HttpError(400, 'Bad Request', 'cover 必须是 jpg/png 图片');
         }
-        if (bytes > COVER_MAX_BYTES) {
+        coverBuffer = await collectBuffer(part.file);
+        if (coverBuffer.length > COVER_MAX_BYTES) {
           throw new HttpError(400, 'Bad Request', 'cover 大小不能超过 2MB');
         }
+        coverExtension = ext;
       } else {
         await drainAndCount(part.file); // 未知文件字段：排干丢弃
       }
@@ -101,7 +107,7 @@ async function parseAndValidate(request: FastifyRequest): Promise<ParsedUpload> 
     }
   }
 
-  return { fields, hasText, textBuffer };
+  return { fields, hasText, textBuffer, coverBuffer, coverExtension };
 }
 
 /**
@@ -172,13 +178,13 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     }
 
     try {
-      const { fields, hasText, textBuffer } = await parseAndValidate(request);
+      const { fields, hasText, textBuffer, coverBuffer, coverExtension } = await parseAndValidate(request);
       if (!hasText || !textBuffer) throw new HttpError(400, 'Bad Request', 'text 文件为必填项');
       const params = buildJobParams(fields);
 
       // 真实创建：内部做文本预处理、磁盘预检（不足抛 507）、落盘并后台跑流水线。
       // createJob 内部 releaseSlot 并转为真实计数。
-      const job = await manager.createJob(params, textBuffer);
+      const job = await manager.createJob(params, textBuffer, coverBuffer || undefined, coverExtension || undefined);
       return reply.code(201).send({
         jobId: job.jobId,
         statusUrl: `/api/v1/audiobook/jobs/${job.jobId}`,

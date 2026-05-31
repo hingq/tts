@@ -1,0 +1,621 @@
+/**
+ * @file api.test.ts
+ * @description API 集成测试。使用 fastify.inject 模拟请求，
+ * 验证创建任务、SSE 进度流、断点下载、任务取消/恢复以及 AI 流端点。
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import Fastify from 'fastify';
+import multipart from '@fastify/multipart';
+import { FastifySSEPlugin } from 'fastify-sse-v2';
+import cors from '@fastify/cors';
+import { registerRoutes } from '../src/routes/jobs.js';
+import { EventEmitter } from 'node:events';
+import { Readable } from 'node:stream';
+
+// ─── 提升 mock 桩 ───────────────────────────────────────────────
+
+const mocks = vi.hoisted(() => ({
+  statSync: vi.fn(),
+  createReadStream: vi.fn(),
+  writeFile: vi.fn(),
+}));
+
+// Mock node:fs to prevent hitting actual files during testing
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    default: {
+      ...actual,
+      statSync: (path: string, options?: any) => {
+        if (path.includes('output.m4b')) {
+          return mocks.statSync(path, options);
+        }
+        return actual.default.statSync(path, options);
+      },
+      createReadStream: (path: string, options?: any) => {
+        if (path.includes('output.m4b')) {
+          return mocks.createReadStream(path, options);
+        }
+        return actual.default.createReadStream(path, options);
+      },
+      writeFile: (path: string, data: any, options: any, callback?: any) => {
+        if (path.includes('.downloaded')) {
+          const cb = typeof options === 'function' ? options : callback;
+          mocks.writeFile(path, data, cb);
+          if (cb) cb(null);
+          return;
+        }
+        return actual.default.writeFile(path, data, options, callback);
+      },
+    },
+  };
+});
+
+// Mock JobManager as a clean EventEmitter subclass
+const mockManager = new (class extends EventEmitter {
+  tryReserveSlot = vi.fn();
+  releaseSlot = vi.fn();
+  createJob = vi.fn();
+  getJob = vi.fn();
+  cancelJob = vi.fn();
+  resumeJob = vi.fn();
+})();
+
+vi.mock('../src/services/job-manager.js', () => {
+  return {
+    JobManager: {
+      getInstance: () => mockManager,
+    },
+    JobCreationError: class extends Error {
+      constructor(
+        public statusCode: number,
+        public publicName: string,
+        message: string,
+      ) {
+        super(message);
+        this.name = 'JobCreationError';
+      }
+    },
+  };
+});
+
+// Helper to construct boundary-delimited multipart form-data
+function buildMultipartBody(
+  fields: Record<string, string>,
+  files: Array<{ name: string; filename: string; mimetype: string; data: string | Buffer }>,
+  boundary: string,
+): Buffer {
+  const chunks: Buffer[] = [];
+  for (const [key, val] of Object.entries(fields)) {
+    chunks.push(Buffer.from(`--${boundary}\r\n`));
+    chunks.push(Buffer.from(`Content-Disposition: form-data; name="${key}"\r\n\r\n`));
+    chunks.push(Buffer.from(`${val}\r\n`));
+  }
+  for (const file of files) {
+    chunks.push(Buffer.from(`--${boundary}\r\n`));
+    chunks.push(
+      Buffer.from(
+        `Content-Disposition: form-data; name="${file.name}"; filename="${file.filename}"\r\n`,
+      ),
+    );
+    chunks.push(Buffer.from(`Content-Type: ${file.mimetype}\r\n\r\n`));
+    chunks.push(Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data));
+    chunks.push(Buffer.from('\r\n'));
+  }
+  chunks.push(Buffer.from(`--${boundary}--\r\n`));
+  return Buffer.concat(chunks);
+}
+
+// Helper to construct Fastify instance for route tests
+async function buildApp() {
+  const app = Fastify({ logger: false });
+  await app.register(multipart, {
+    limits: {
+      files: 2,
+      fileSize: 10 * 1024 * 1024,
+    },
+  });
+  await app.register(FastifySSEPlugin);
+  await app.register(cors, { origin: true });
+  await app.register(registerRoutes, { prefix: '/api/v1' });
+  return app;
+}
+
+// ─── 测试用例 ──────────────────────────────────────────────────
+
+describe('API Integration Tests', () => {
+  let app: any;
+
+  beforeEach(async () => {
+    app = await buildApp();
+    vi.clearAllMocks();
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  // ── 4.1 创建任务接口 ─────────────────────────────────────────
+
+  describe('POST /api/v1/jobs (创建任务)', () => {
+    const boundary = '----VitestBoundary123';
+
+    it('成功创建任务并返回 201', async () => {
+      mockManager.tryReserveSlot.mockReturnValue(true);
+      mockManager.createJob.mockResolvedValue({
+        jobId: 'test-uuid-1234',
+        status: 'pending',
+        downloadUrl: null,
+      });
+
+      const body = buildMultipartBody(
+        { title: '测试书', voice: 'zh-CN-YunxiNeural' },
+        [{ name: 'text', filename: 'text.txt', mimetype: 'text/plain', data: '小说正文内容。' }],
+        boundary,
+      );
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/v1/jobs',
+        headers: {
+          'content-type': `multipart/form-data; boundary=${boundary}`,
+        },
+        payload: body,
+      });
+
+      expect(response.statusCode).toBe(201);
+      const json = JSON.parse(response.body);
+      expect(json.jobId).toBe('test-uuid-1234');
+      expect(json.status).toBe('pending');
+      expect(json.statusUrl).toBe('/api/v1/audiobook/jobs/test-uuid-1234');
+      expect(mockManager.tryReserveSlot).toHaveBeenCalled();
+      expect(mockManager.createJob).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: '测试书',
+          voice: 'zh-CN-YunxiNeural',
+        }),
+        expect.any(Buffer),
+        undefined,
+        undefined,
+      );
+    });
+
+    it('并发超限返回 503 Service Unavailable', async () => {
+      mockManager.tryReserveSlot.mockReturnValue(false);
+
+      const body = buildMultipartBody(
+        { title: '测试书', voice: 'zh-CN-YunxiNeural' },
+        [{ name: 'text', filename: 'text.txt', mimetype: 'text/plain', data: '正文' }],
+        boundary,
+      );
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/v1/jobs',
+        headers: {
+          'content-type': `multipart/form-data; boundary=${boundary}`,
+        },
+        payload: body,
+      });
+
+      expect(response.statusCode).toBe(503);
+      const json = JSON.parse(response.body);
+      expect(json.error).toBe('Service Unavailable');
+      expect(mockManager.tryReserveSlot).toHaveBeenCalled();
+      expect(mockManager.createJob).not.toHaveBeenCalled();
+      expect(mockManager.releaseSlot).not.toHaveBeenCalled();
+    });
+
+    it('缺少 text 字段返回 400 Bad Request 并释放名额', async () => {
+      mockManager.tryReserveSlot.mockReturnValue(true);
+
+      const body = buildMultipartBody(
+        { title: '测试书', voice: 'zh-CN-YunxiNeural' },
+        [], // 没有文件
+        boundary,
+      );
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/v1/jobs',
+        headers: {
+          'content-type': `multipart/form-data; boundary=${boundary}`,
+        },
+        payload: body,
+      });
+
+      expect(response.statusCode).toBe(400);
+      const json = JSON.parse(response.body);
+      expect(json.error).toBe('Bad Request');
+      expect(json.message).toContain('text 文件为必填项');
+      expect(mockManager.releaseSlot).toHaveBeenCalled();
+    });
+
+    it('发音人不在白名单返回 400 Bad Request', async () => {
+      mockManager.tryReserveSlot.mockReturnValue(true);
+
+      const body = buildMultipartBody(
+        { title: '测试书', voice: 'zh-CN-IllegalVoice' },
+        [{ name: 'text', filename: 'text.txt', mimetype: 'text/plain', data: '正文' }],
+        boundary,
+      );
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/v1/jobs',
+        headers: {
+          'content-type': `multipart/form-data; boundary=${boundary}`,
+        },
+        payload: body,
+      });
+
+      expect(response.statusCode).toBe(400);
+      const json = JSON.parse(response.body);
+      expect(json.message).toContain('voice 不在白名单内');
+      expect(mockManager.releaseSlot).toHaveBeenCalled();
+    });
+
+    it('磁盘空间不足返回 507 Insufficient Storage', async () => {
+      mockManager.tryReserveSlot.mockReturnValue(true);
+      // 模拟磁盘不足异常
+      const { JobCreationError } = await import('../src/services/job-manager.js');
+      mockManager.createJob.mockRejectedValue(
+        new JobCreationError(507, 'Insufficient Storage', '磁盘空间不足'),
+      );
+
+      const body = buildMultipartBody(
+        { title: '测试书', voice: 'zh-CN-YunxiNeural' },
+        [{ name: 'text', filename: 'text.txt', mimetype: 'text/plain', data: '小说正文' }],
+        boundary,
+      );
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/v1/jobs',
+        headers: {
+          'content-type': `multipart/form-data; boundary=${boundary}`,
+        },
+        payload: body,
+      });
+
+      expect(response.statusCode).toBe(507);
+      const json = JSON.parse(response.body);
+      expect(json.error).toBe('Insufficient Storage');
+      expect(mockManager.releaseSlot).toHaveBeenCalled();
+    });
+  });
+
+  // ── 4.2 SSE 进度监控 ─────────────────────────────────────────
+
+  describe('GET /api/v1/jobs/:jobId/events (SSE 监控)', () => {
+    it('任务不存在返回 404', async () => {
+      mockManager.getJob.mockReturnValue(undefined);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/v1/jobs/nonexistent-id/events',
+      });
+
+      expect(response.statusCode).toBe(404);
+      const json = JSON.parse(response.body);
+      expect(json.error).toBe('Not Found');
+    });
+
+    it('已完成任务直接完成 SSE 传输并关闭', async () => {
+      mockManager.getJob.mockReturnValue({
+        jobId: 'done-uuid',
+        status: 'done',
+        progress: {
+          phase: 'ready',
+          ttsChunks: { done: 3, total: 3 },
+          transcodeChunks: { done: 3, total: 3 },
+        },
+        downloadUrl: '/api/v1/audiobook/jobs/done-uuid/file',
+        error: null,
+        startedAt: '2026-01-01T00:00:00.000Z',
+        finishedAt: '2026-01-01T00:00:10.000Z',
+        title: '已完成的书',
+        voice: 'zh-CN-YunxiNeural',
+      });
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/v1/jobs/done-uuid/events',
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(response.body).toContain('event: handshake');
+      expect(response.body).toContain('event: progress');
+      expect(response.body).toContain('event: status');
+      expect(response.body).toContain('"status":"done"');
+    });
+
+    it('运行中任务能够通过事件监听接收更新并在到达终态时结束', async () => {
+      const mockJob = {
+        jobId: 'running-uuid',
+        status: 'running',
+        progress: {
+          phase: 'tts',
+          ttsChunks: { done: 0, total: 3 },
+          transcodeChunks: { done: 0, total: 3 },
+        },
+        downloadUrl: null,
+        error: null,
+        startedAt: '2026-01-01T00:00:00.000Z',
+        title: '运行中的书',
+        voice: 'zh-CN-YunxiNeural',
+      };
+
+      mockManager.getJob.mockReturnValue(mockJob);
+
+      // 模拟在连接建立后，过 50ms 派发完成事件，从而终止 SSE 传输
+      setTimeout(() => {
+        mockManager.emit('job:running-uuid', {
+          ...mockJob,
+          status: 'done',
+          progress: {
+            phase: 'ready',
+            ttsChunks: { done: 3, total: 3 },
+            transcodeChunks: { done: 3, total: 3 },
+          },
+          downloadUrl: '/api/v1/audiobook/jobs/running-uuid/file',
+          finishedAt: '2026-01-01T00:00:15.000Z',
+        });
+      }, 50);
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/v1/jobs/running-uuid/events',
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('event: handshake');
+      // 包含初始运行状态
+      expect(response.body).toContain('"status":"running"');
+      // 包含最终状态
+      expect(response.body).toContain('event: status');
+      expect(response.body).toContain('"status":"done"');
+    });
+  });
+
+  // ── 4.3 断点下载 ───────────────────────────────────────────
+
+  describe('GET /api/v1/jobs/:jobId/file (音频文件下载)', () => {
+    it('任务未完成返回 409 Conflict', async () => {
+      mockManager.getJob.mockReturnValue({
+        jobId: 'running-id',
+        status: 'running',
+      });
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/v1/jobs/running-id/file',
+      });
+
+      expect(response.statusCode).toBe(409);
+      expect(JSON.parse(response.body).error).toBe('Conflict');
+    });
+
+    it('输出文件不存在在文件系统返回 404', async () => {
+      mockManager.getJob.mockReturnValue({
+        jobId: 'done-id',
+        status: 'done',
+        title: '不存在文件',
+      });
+      // 模拟 fs 抛出 ENOENT
+      mocks.statSync.mockImplementation(() => {
+        throw new Error('ENOENT');
+      });
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/v1/jobs/done-id/file',
+      });
+
+      expect(response.statusCode).toBe(404);
+    });
+
+    describe('完整及 Partial Content Range 下载', () => {
+      beforeEach(() => {
+        mockManager.getJob.mockReturnValue({
+          jobId: 'done-id',
+          status: 'done',
+          title: '已完成的书',
+        });
+        mocks.statSync.mockReturnValue({ size: 2000 });
+        mocks.createReadStream.mockImplementation((path: string, options?: any) => {
+          const start = options?.start ?? 0;
+          const end = options?.end ?? 1999;
+          const length = end - start + 1;
+          return Readable.from(Buffer.alloc(length));
+        });
+      });
+
+      it('无 Range 头请求：返回 200 及完整文件，并调用 downloaded 异步标记', async () => {
+        const response = await app.inject({
+          method: 'GET',
+          url: '/api/v1/jobs/done-id/file',
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(response.headers['content-length']).toBe('2000');
+        expect(response.headers['accept-ranges']).toBe('bytes');
+        expect(response.headers['content-type']).toBe('audio/mp4');
+        expect(response.rawPayload.length).toBe(2000);
+        expect(mocks.writeFile).toHaveBeenCalledWith(
+          expect.stringContaining('.downloaded'),
+          '',
+          expect.any(Function),
+        );
+      });
+
+      it('合法 Range 头请求：返回 206 局部内容', async () => {
+        const response = await app.inject({
+          method: 'GET',
+          url: '/api/v1/jobs/done-id/file',
+          headers: {
+            range: 'bytes=0-1023',
+          },
+        });
+
+        expect(response.statusCode).toBe(206);
+        expect(response.headers['content-range']).toBe('bytes 0-1023/2000');
+        expect(response.headers['content-length']).toBe('1024');
+        expect(response.headers['accept-ranges']).toBe('bytes');
+        expect(response.rawPayload.length).toBe(1024);
+        // 部分下载不触发 downloaded 标记
+        expect(mocks.writeFile).not.toHaveBeenCalled();
+      });
+
+      it('Range 越界返回 416', async () => {
+        const response = await app.inject({
+          method: 'GET',
+          url: '/api/v1/jobs/done-id/file',
+          headers: {
+            range: 'bytes=2000-3000',
+          },
+        });
+
+        expect(response.statusCode).toBe(416);
+        expect(response.headers['content-range']).toBe('bytes */2000');
+      });
+
+      it('Range 格式非法返回 416', async () => {
+        const response = await app.inject({
+          method: 'GET',
+          url: '/api/v1/jobs/done-id/file',
+          headers: {
+            range: 'bytes=invalid',
+          },
+        });
+
+        expect(response.statusCode).toBe(416);
+      });
+    });
+  });
+
+  // ── 4.4 取消与恢复 ───────────────────────────────────────────
+
+  describe('DELETE /api/v1/jobs/:jobId (取消任务)', () => {
+    it('任务不存在返回 404', async () => {
+      mockManager.getJob.mockReturnValue(undefined);
+
+      const response = await app.inject({
+        method: 'DELETE',
+        url: '/api/v1/jobs/nonexistent-id',
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(mockManager.cancelJob).not.toHaveBeenCalled();
+    });
+
+    it('活跃任务调用 cancelJob 并返回 204', async () => {
+      mockManager.getJob.mockReturnValue({
+        jobId: 'active-id',
+        status: 'running',
+      });
+
+      const response = await app.inject({
+        method: 'DELETE',
+        url: '/api/v1/jobs/active-id',
+      });
+
+      expect(response.statusCode).toBe(204);
+      expect(mockManager.cancelJob).toHaveBeenCalledWith('active-id');
+    });
+
+    it('终态任务幂等直接返回 204 且不调用 cancelJob', async () => {
+      mockManager.getJob.mockReturnValue({
+        jobId: 'done-id',
+        status: 'done',
+      });
+
+      const response = await app.inject({
+        method: 'DELETE',
+        url: '/api/v1/jobs/done-id',
+      });
+
+      expect(response.statusCode).toBe(204);
+      expect(mockManager.cancelJob).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /api/v1/jobs/:jobId/resume (恢复任务)', () => {
+    it('任务恢复成功返回 200 并携带任务详情', async () => {
+      mockManager.tryReserveSlot.mockReturnValue(true);
+      mockManager.resumeJob.mockReturnValue('ok');
+      mockManager.getJob.mockReturnValue({
+        jobId: 'resumed-id',
+        status: 'running',
+      });
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/v1/jobs/resumed-id/resume',
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(JSON.parse(response.body).status).toBe('running');
+      expect(mockManager.resumeJob).toHaveBeenCalledWith('resumed-id');
+      expect(mockManager.releaseSlot).toHaveBeenCalled(); // 恢复调用后会释放占位槽
+    });
+
+    it('并发满导致无法恢复返回 503', async () => {
+      mockManager.tryReserveSlot.mockReturnValue(false);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/v1/jobs/resumed-id/resume',
+      });
+
+      expect(response.statusCode).toBe(503);
+      expect(mockManager.resumeJob).not.toHaveBeenCalled();
+    });
+
+    it('任务不存在返回 404', async () => {
+      mockManager.tryReserveSlot.mockReturnValue(true);
+      mockManager.resumeJob.mockReturnValue('not_found');
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/v1/jobs/nonexistent-id/resume',
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(mockManager.releaseSlot).toHaveBeenCalled();
+    });
+
+    it('非 failed/canceled 状态任务不能恢复返回 400', async () => {
+      mockManager.tryReserveSlot.mockReturnValue(true);
+      mockManager.resumeJob.mockReturnValue('invalid_state');
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/v1/jobs/running-id/resume',
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(mockManager.releaseSlot).toHaveBeenCalled();
+    });
+  });
+
+  // ── 额外测试 (AI Stream 接口) ─────────────────────────────────
+
+  describe('GET /api/v1/sse (AI Stream 接口)', () => {
+    it('正确生成 AI 流式文本，包含 handshake、ai-stream 与 ai-complete', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/v1/sse',
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(response.body).toContain('event: handshake');
+      expect(response.body).toContain('event: ai-stream');
+      expect(response.body).toContain('event: ai-complete');
+    }, 15000);
+  });
+});
