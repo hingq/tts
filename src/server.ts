@@ -10,7 +10,7 @@ import { FastifySSEPlugin } from 'fastify-sse-v2';
 import { config } from './config.js';
 import { JobManager } from './services/job-manager.js';
 import { startGarbageCollector } from './services/gc.js';
-
+import cors from '@fastify/cors';
 const fastify = Fastify({
   logger: {
     transport: {
@@ -63,7 +63,11 @@ async function bootstrap(): Promise<void> {
 
   // 注册 SSE 支持
   await fastify.register(FastifySSEPlugin);
-
+  await fastify.register(cors, {
+    origin: true,
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  });
   // 注册业务 API 路由
   // 动态导入路由插件，配合 build.js 的 splitting:true 将路由层拆为独立 chunk
   const { registerRoutes } = await import('./routes/jobs.js');

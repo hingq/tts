@@ -229,7 +229,11 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     if (isTerminal(job.status)) {
       reply.sse({
         event: 'status',
-        data: JSON.stringify({ status: job.status, downloadUrl: job.downloadUrl, error: job.error }),
+        data: JSON.stringify({
+          status: job.status,
+          downloadUrl: job.downloadUrl,
+          error: job.error,
+        }),
       });
       reply.sseContext.source.end();
       return;
@@ -271,53 +275,48 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
    * 复用与 /jobs/:jobId/events 相同的 cleanup + heartbeat 模式。
    */
   fastify.get('/sse', async (request, reply) => {
-    const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
     const MOCK_TEXT =
-      '人工智能（AI）是模拟、延伸和扩展人的智能的理论、方法、技术及应用系统的一门新的技术科学。' +
-      '随着深度学习的突破，大语言模型在 2020 年代迎来了爆发式增长，改变了人类与机器交互的方式...';
-    const TOKEN_DELAY_MS = 50;
+      `# 🚀 Hermes Agent 接入测试\n\n` +
+      `这是流式传输的 **Markdown** 文本渲染测试。Hermes Agent 运行状态正常。\n\n` +
+      `### 1. 核心功能特点\n` +
+      `* **工具调用**：支持自动执行终端命令、运行 Python 脚本。\n` +
+      `* **沙箱隔离**：支持 Local、Docker、SSH 等 6 种环境。\n\n` +
+      `### 2. 代码执行示例\n` +
+      `\`\`\`javascript\n` +
+      `const http = require('http');\n` +
+      `server.listen(3000);\n` +
+      `\`\`\`\n\n` +
+      `--- \n` +
+      `检查完毕，即将发射 ai-complete 信号...`;
 
-    // 1. 握手（必须先于 cleanup 注册，以初始化 sseContext）
-    reply.sse({
-      event: 'handshake',
-      data: JSON.stringify({ status: '200', message: 'connected' }),
-    });
+    async function* createTokenStream() {
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-    // --- cleanup guard（与 events 路由保持一致） ---
-    let cleaned = false;
-    const cleanup = (): void => {
-      if (cleaned) return;
-      cleaned = true;
-      clearInterval(heartbeat);
-      reply.sseContext.source.end();
-    };
+      // 🔥 握手事件：纯 Fastify 风格的第一个发射信号
+      yield {
+        event: 'handshake',
+        data: JSON.stringify({ status: '200', message: 'connected' }),
+      };
 
-    // 心跳：防止反代空闲超时切断长连接
-    const heartbeat = setInterval(() => reply.sse({ comment: 'keepalive' }), 20_000);
-    request.raw.on('close', cleanup);
+      // 🔥 核心修正：使用 for...of 遍历，绝不切碎 UTF-8 编码
+      for (const char of MOCK_TEXT) {
+        // 如果遇到换行符，依然转义为 '\\n' 字符串发给前端，避开 SSE 协议的“空行吞噬”漏洞
+        if (char === '\n') {
+          yield { event: 'ai-stream', data: '\\n' };
+        } else {
+          yield { event: 'ai-stream', data: char };
+        }
 
-    // 2. 按字切分后逐 token 推送
-    const tokens = [...MOCK_TEXT]; // 使用展开运算符正确处理多字节字符（如 emoji）
-
-    try {
-      for (const token of tokens) {
-        if (cleaned) break;
-
-        reply.sse({ event: 'ai-stream', data: token });
-        await sleep(TOKEN_DELAY_MS);
+        await sleep(25); // 打字机速度
       }
 
-      // 3. 推送完毕，发送结束事件
-      if (!cleaned) {
-        reply.sse({ event: 'ai-complete', data: 'done' });
-      }
-    } catch (err) {
-      // 客户端已断开时写入会抛异常，静默处理即可
-      request.log.debug({ err }, '/see streaming interrupted');
-    } finally {
-      cleanup();
+      yield { event: 'ai-complete', data: 'done' };
     }
+
+    // Fastify 会自动接管心跳（Keep-Alive）、编码（UTF-8）以及客户端连接断开时的资源释放（Cleanup）
+    return reply.sse(createTokenStream());
   });
   /** 带 Range 的文件下载；下载完成后异步清理工作目录。 */
   fastify.get('/jobs/:jobId/file', async (request, reply) => {
@@ -424,8 +423,6 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     if (result === 'not_found') {
       return reply.code(404).send({ error: 'Not Found', message: '任务不存在' });
     }
-    return reply
-      .code(400)
-      .send({ error: 'Bad Request', message: '仅 failed/canceled 任务可恢复' });
+    return reply.code(400).send({ error: 'Bad Request', message: '仅 failed/canceled 任务可恢复' });
   });
 }
