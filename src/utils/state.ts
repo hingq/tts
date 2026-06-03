@@ -32,13 +32,8 @@ export function saveJobState(jobDir: string, state: JobState): Promise<void> {
 
   const currentQueue = writeQueues.get(jobDir) || Promise.resolve();
   const nextQueue = currentQueue.then(async () => {
-    try {
-      await fs.writeFile(tmpPath, JSON.stringify(state, null, 2), 'utf-8');
-      await fs.rename(tmpPath, filePath);
-    } catch (err) {
-      // 这里的错误需要继续往上抛，以便外部调用方感知写入失败
-      throw err;
-    }
+    await fs.writeFile(tmpPath, JSON.stringify(state, null, 2), 'utf-8');
+    await fs.rename(tmpPath, filePath);
   });
 
   writeQueues.set(jobDir, nextQueue);

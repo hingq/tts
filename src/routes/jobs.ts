@@ -178,13 +178,19 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     }
 
     try {
-      const { fields, hasText, textBuffer, coverBuffer, coverExtension } = await parseAndValidate(request);
+      const { fields, hasText, textBuffer, coverBuffer, coverExtension } =
+        await parseAndValidate(request);
       if (!hasText || !textBuffer) throw new HttpError(400, 'Bad Request', 'text 文件为必填项');
       const params = buildJobParams(fields);
 
       // 真实创建：内部做文本预处理、磁盘预检（不足抛 507）、落盘并后台跑流水线。
       // createJob 内部 releaseSlot 并转为真实计数。
-      const job = await manager.createJob(params, textBuffer, coverBuffer || undefined, coverExtension || undefined);
+      const job = await manager.createJob(
+        params,
+        textBuffer,
+        coverBuffer || undefined,
+        coverExtension || undefined,
+      );
       return reply.code(201).send({
         jobId: job.jobId,
         statusUrl: `/api/v1/audiobook/jobs/${job.jobId}`,

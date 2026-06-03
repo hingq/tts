@@ -86,30 +86,43 @@ export class JobPipeline {
     jobState.phase = 'tts';
     await saveJobState(jobDir, jobState);
 
+    // 熔断状态：记录首个错误。任一分片失败后，尚未开始的分片应立即停止派发，
+    // 不再发 TTS 请求 / spawn ffmpeg / 改写任务状态——避免“抛错后阶段一仍在继续”。
+    let firstError: unknown;
+    // 统一“应停止”判定：被取消，或已发生过失败，均视为停止信号。
+    const shouldStop = (): boolean => isCanceled() || firstError !== undefined;
+
     // 建立分片 Promise 数组：每条链把 TTS 与转码以流水线方式串联
     const chunkTasks = jobState.chunks.map((chunk) =>
       this.ttsLimit(async () => {
-        // 取消或断点续传：已就绪 / 已取消的分片直接跳过 TTS
-        if (isCanceled()) return;
+        // 取消 / 已失败 / 断点续传：已就绪的分片直接跳过 TTS
+        if (shouldStop()) return;
         if (chunk.status === 'transcode_done' || chunk.status === 'tts_done') return;
         await this.runTts(chunk, jobState, jobDir, onProgress);
         // TTS 成功后插入随机延时（[1000,2500)ms）打散请求时刻，缓解风控
         await delay(TTS_DELAY_MIN_MS + Math.random() * TTS_DELAY_JITTER_MS);
-      }).then(() =>
-        // TTS 成功（或被跳过）后，立刻把该分片推入转码并发池——无需等待其它分片的 TTS
-        this.transcodeLimit(async () => {
-          if (isCanceled()) return;
-          // 已转码：断点续传跳过
-          if (chunk.status === 'transcode_done') return;
-          // TTS 未成功（被取消跳过 / 失败）：没有可用 MP3，转码无从谈起
-          if (chunk.status !== 'tts_done') return;
-          await this.runTranscode(chunk, jobState, jobDir, onProgress);
+      })
+        .then(() =>
+          // TTS 成功（或被跳过）后，立刻把该分片推入转码并发池——无需等待其它分片的 TTS
+          this.transcodeLimit(async () => {
+            if (shouldStop()) return;
+            // 已转码：断点续传跳过
+            if (chunk.status === 'transcode_done') return;
+            // TTS 未成功（被取消跳过 / 失败）：没有可用 MP3，转码无从谈起
+            if (chunk.status !== 'tts_done') return;
+            await this.runTranscode(chunk, jobState, jobDir, onProgress);
+          }),
+        )
+        // 登记首个错误并吞下，避免未处理拒绝；后续分片据 shouldStop() 立即跳过
+        .catch((err) => {
+          if (firstError === undefined) firstError = err;
         }),
-      ),
     );
 
-    // 等待所有分片的 TTS 与转码链条全部结束
+    // 等待所有分片链条收口（含因 shouldStop() 立即返回者），不留孤儿任务在失败后改状态
     await Promise.all(chunkTasks);
+    // 有失败则原样上抛，交由 runJob 置 failed 并经 SSE 推出 error
+    if (firstError !== undefined) throw firstError;
   }
 
   /**

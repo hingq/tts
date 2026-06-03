@@ -9,6 +9,7 @@ import multipart from '@fastify/multipart';
 import { FastifySSEPlugin } from 'fastify-sse-v2';
 import { config } from './config.js';
 import { JobManager } from './services/job-manager.js';
+import { validateFfmpegBinaries } from './services/audio-transcoder.js';
 import { startGarbageCollector } from './services/gc.js';
 import cors from '@fastify/cors';
 const fastify = Fastify({
@@ -96,6 +97,9 @@ async function gracefulShutdown(signal: string): Promise<void> {
 const start = async (): Promise<void> => {
   try {
     await bootstrap();
+    // 启动期二进制预检：ffmpeg / ffprobe 缺失或不在 PATH 时直接阻断启动，
+    // 避免每个任务跑到转码阶段才以 spawn ENOENT 失败。
+    await validateFfmpegBinaries();
     // 自动扫描 TMP_ROOT，恢复未完成任务并断点续传
     await JobManager.getInstance().recoverJobs();
     // 启动定时垃圾回收，清理过期工作目录

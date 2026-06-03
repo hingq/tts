@@ -136,8 +136,7 @@ export class JobManager extends EventEmitter {
         ttsChunks: { done: state.completedTTS, total: state.totalChunks },
         transcodeChunks: { done: state.completedTranscode, total: state.totalChunks },
       },
-      downloadUrl:
-        state.status === 'done' ? `/api/v1/audiobook/jobs/${state.jobId}/file` : null,
+      downloadUrl: state.status === 'done' ? `/api/v1/audiobook/jobs/${state.jobId}/file` : null,
       error: state.error ?? null,
       startedAt: state.createdAt,
       finishedAt: terminal ? state.updatedAt : null,
@@ -177,7 +176,6 @@ export class JobManager extends EventEmitter {
   ): Promise<JobInfo> {
     const jobId = randomUUID();
     const jobDir = path.join(config.TMP_ROOT, jobId);
-
     // 1. 文本预处理：切分为 TTS 分块。
     //    注意：以下校验若抛错，并发名额仍为“预留”状态，由路由层 catch 归还，避免重复释放。
     const ttsChunks = processText(text);

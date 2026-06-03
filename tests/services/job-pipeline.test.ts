@@ -183,4 +183,25 @@ describe('JobPipeline.execute', () => {
     expect(mocks.transcodeToM4A).toHaveBeenCalledTimes(1);
     expect(ttsDone.status).toBe('transcode_done');
   });
+
+  it('熔断：首个分片失败后停止派发剩余分片，并上抛该错误', async () => {
+    // 每次转码都失败（模拟 spawn ffmpeg ENOENT 这类不可恢复错误）
+    mocks.transcodeToM4A.mockRejectedValue(new Error('spawn ffmpeg ENOENT'));
+
+    const chunks = Array.from({ length: 12 }, (_, i) => makeChunk(i));
+    const state = makeState(chunks);
+    const pipeline = new JobPipeline();
+
+    // execute 应以首个错误 reject（交由 runJob 置 failed）
+    await expect(runToCompletion(pipeline.execute(state, dir, () => {}))).rejects.toThrow(
+      'spawn ffmpeg ENOENT',
+    );
+
+    // 关键：熔断后尚未开始的分片被跳过，而非把 12 个分片全部跑一遍
+    // TTS 并发上限固定为 2，故首个失败登记后绝大多数 TTS / 转码不会再派发
+    expect(mocks.synthesize.mock.calls.length).toBeLessThan(chunks.length);
+    expect(mocks.transcodeToM4A.mock.calls.length).toBeLessThan(chunks.length);
+    // 转码无一成功，完成计数保持为 0
+    expect(state.completedTranscode).toBe(0);
+  });
 });
