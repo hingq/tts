@@ -79,31 +79,43 @@ if (!fs.existsSync(absoluteTmpRoot)) {
 export const config: Config = {
   // 服务监听端口，默认 3000
   PORT: parseNumber(process.env.PORT, 3000),
+
   // 服务绑定主机，默认 127.0.0.1
   HOST: process.env.HOST || '127.0.0.1',
+
   // 临时工作空间根目录，已解析为绝对路径并在初始化时自动递归创建
   TMP_ROOT: absoluteTmpRoot,
+
   // 单次任务允许上传的最大文本体积（单位: MB），默认 5
   MAX_TEXT_SIZE_MB: parseNumber(process.env.MAX_TEXT_SIZE_MB, 5),
+
   // 全局最大并发运行任务数，默认 2
   MAX_CONCURRENT_JOBS: parseNumber(process.env.MAX_CONCURRENT_JOBS, 2),
+
   // 微软 Edge TTS 引擎的并发请求上限，默认 2
   CONCURRENT_TTS_LIMIT: parseNumber(process.env.CONCURRENT_TTS_LIMIT, 2),
+
   // FFmpeg 转码并发线程数上限，默认使用 CPU 核心数减一
   CONCURRENT_TRANSCODE_LIMIT: parseNumber(
     process.env.CONCURRENT_TRANSCODE_LIMIT,
     Math.max(1, os.cpus().length - 1),
   ),
+
   // 默认的语音合成引擎，默认使用 edge-tts
   DEFAULT_TTS_ENGINE: process.env.DEFAULT_TTS_ENGINE || 'edge-tts',
+
   // 单个子进程（如转码）执行超时时间（单位: 毫秒），默认 60000（1分钟）
   SUBPROCESS_TIMEOUT_MS: parseNumber(process.env.SUBPROCESS_TIMEOUT_MS, 60000),
+
   // 整个有声书生成任务全局超时时间（单位: 毫秒），默认 3600000（1小时）
   GLOBAL_TASK_TIMEOUT_MS: parseNumber(process.env.GLOBAL_TASK_TIMEOUT_MS, 3600000),
+
   // 合成语音请求时使用的 HTTP 代理网关地址，非必填
   TTS_PROXY: process.env.TTS_PROXY || undefined,
+
   // FFmpeg 可执行二进制路径，默认 'ffmpeg'
   FFMPEG_PATH: process.env.FFMPEG_PATH || 'ffmpeg',
+
   // FFprobe 可执行二进制路径，默认 'ffprobe'
   FFPROBE_PATH: process.env.FFPROBE_PATH || 'ffprobe',
 };

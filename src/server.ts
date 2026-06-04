@@ -75,24 +75,46 @@ async function bootstrap(): Promise<void> {
   await fastify.register(registerRoutes, { prefix: '/api/v1' });
 }
 
-/**
- * 优雅停机：反转健康检查 → 停止接收新连接 → 清理 Mock 定时器 → 退出。
- * @param signal 触发停机的信号名
- */
-async function gracefulShutdown(signal: string): Promise<void> {
-  fastify.log.info(`Received ${signal}, shutting down gracefully...`);
-  shuttingDown = true;
-  try {
-    await fastify.close(); // 拒绝新连接，等待 in-flight 请求结束
-    if (gcTimer) clearInterval(gcTimer); // 停止定时垃圾回收
-    JobManager.getInstance().clearAllTimers(); // 收尾：清理任务管理器资源
-    process.exit(0);
-  } catch (err) {
-    fastify.log.error(err);
-    process.exit(1);
-  }
-}
+/** 防止重复关闭 */
+let isShuttingDown = false;
 
+async function shutdown(exitCode: number, reason: string): Promise<never> {
+  if (isShuttingDown) {
+    // 已经在关闭中，直接强制退出
+    process.exit(exitCode);
+  }
+  isShuttingDown = true;
+  shuttingDown = true;
+
+  console.error(`[shutdown] reason=${reason}, exitCode=${exitCode}`);
+
+  if (gcTimer) {
+    clearInterval(gcTimer);
+    gcTimer = undefined;
+  }
+
+  try {
+    JobManager.getInstance().clearAllTimers();
+  } catch (e) {
+    console.error('[shutdown] JobManager.clearAllTimers() error:', e);
+  }
+
+  try {
+    // 给 fastify.close() 加硬超时，防止 hang 死
+    await Promise.race([
+      fastify.close(),
+      new Promise<void>((_, reject) =>
+        setTimeout(() => reject(new Error('fastify.close() timed out after 5s')), 5000),
+      ),
+    ]);
+  } catch (e) {
+    console.error('[shutdown] fastify.close() error:', e);
+  }
+
+  console.error(`[shutdown] calling process.exit(${exitCode})`);
+
+  process.exit(exitCode);
+}
 /** 启动服务器。 */
 const start = async (): Promise<void> => {
   try {
@@ -108,22 +130,12 @@ const start = async (): Promise<void> => {
     await fastify.listen({ port: config.PORT, host: config.HOST });
     fastify.log.info(`Server is listening on http://${config.HOST}:${config.PORT}`);
   } catch (err) {
-    fastify.log.error(err);
-    process.exit(1);
+    console.error('Failed to start server:', err);
+    await shutdown(1, 'start() failed');
   }
 };
 
-process.on('SIGTERM', () => {
-  console.log('等待关闭');
-
-  void gracefulShutdown('SIGTERM');
-  console.log('⚡️关闭成功');
-});
-process.on('SIGINT', () => {
-  console.log('等待关闭');
-
-  void gracefulShutdown('SIGINT');
-  console.log('⚡️关闭成功');
-});
+process.on('SIGTERM', () => void shutdown(0, 'SIGTERM'));
+process.on('SIGINT', () => void shutdown(0, 'SIGINT'));
 
 start();
