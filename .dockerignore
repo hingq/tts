@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+.gitignore
+.agent
+.claude
+.codex
+plan.md
+README.md
+LICENSE
+tests
+*.log
+.env
