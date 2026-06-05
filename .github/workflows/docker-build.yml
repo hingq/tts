@@ -1,0 +1,43 @@
+name: Build Docker image (tar)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag / tar suffix"
+        required: false
+        default: latest
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: audiobook-generation-service:${{ inputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Save and compress image to tar.gz
+        run: |
+          docker save audiobook-generation-service:${{ inputs.tag }} \
+            | gzip > audiobook-generation-service-${{ inputs.tag }}.tar.gz
+          ls -lh audiobook-generation-service-${{ inputs.tag }}.tar.gz
+
+      - name: Upload tar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: audiobook-generation-service-${{ inputs.tag }}
+          path: audiobook-generation-service-${{ inputs.tag }}.tar.gz
+          retention-days: 7
