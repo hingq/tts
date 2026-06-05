@@ -47,9 +47,15 @@ jobs:
 
       - name: Upload tar to remote server via SSH
         env:
-          host: ${{ secrets.SSH_HOST || '82.156.247.203' }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || '22' }}
-          source: audiobook-generation-service-${{ inputs.tag }}.tar.gz
-          target: ${{ secrets.SSH_TARGET_DIR || '/tts' }}
-        run: scp -o StrictHostKeyChecking=no -i "$key" ./audiobook-generation-service-${{ inputs.tag }}.tar.gz root@${{ secrets.SSH_HOST || '82.156.247.203' }}:${{ secrets.SSH_TARGET_DIR || '/tts' }}/
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST || '82.156.247.203' }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+          SSH_TARGET_DIR: ${{ secrets.SSH_TARGET_DIR || '/tts' }}
+        run: |
+          KEY_FILE="$(mktemp)"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s\n' "$SSH_KEY" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          scp -o StrictHostKeyChecking=no -i "$KEY_FILE" -P "$SSH_PORT" \
+            ./audiobook-generation-service-${{ inputs.tag }}.tar.gz \
+            root@"$SSH_HOST":"$SSH_TARGET_DIR"/
