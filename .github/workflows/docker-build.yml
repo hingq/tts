@@ -32,18 +32,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Save and compress image to tar.gz
+      - name: Save image to tar
         run: |
-          docker save audiobook-generation-service:${{ inputs.tag }} \
-            | gzip > audiobook-generation-service-${{ inputs.tag }}.tar.gz
-          ls -lh audiobook-generation-service-${{ inputs.tag }}.tar.gz
-
-      - name: Upload tar artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: audiobook-generation-service-${{ inputs.tag }}
-          path: audiobook-generation-service-${{ inputs.tag }}.tar.gz
-          retention-days: 7
+          docker save -o audiobook-generation-service-${{ inputs.tag }}.tar \
+            audiobook-generation-service:${{ inputs.tag }}
 
       - name: Upload tar to remote server via SSH
         env:
@@ -56,6 +48,11 @@ jobs:
           trap 'rm -f "$KEY_FILE"' EXIT
           printf '%s\n' "$SSH_KEY" > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
-          scp -o StrictHostKeyChecking=no -i "$KEY_FILE" -P "$SSH_PORT" \
-            ./audiobook-generation-service-${{ inputs.tag }}.tar.gz \
-            root@"$SSH_HOST":"$SSH_TARGET_DIR"/
+          scp -o StrictHostKeyChecking=no \
+              -o ServerAliveInterval=10 \
+              -o ServerAliveCountMax=3 \
+              -o ConnectTimeout=30 \
+              -o BatchMode=yes \
+              -i "$KEY_FILE" -P "$SSH_PORT" \
+              ./audiobook-generation-service-${{ inputs.tag }}.tar \
+              root@"$SSH_HOST":"$SSH_TARGET_DIR"/
