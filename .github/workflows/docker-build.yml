@@ -46,11 +46,10 @@ jobs:
           retention-days: 7
 
       - name: Upload tar to remote server via SSH
-        uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST || '82.156.247.203' }}
-          username: ${{ secrets.SSH_USER || 'root' }}
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT || '22' }}
           source: audiobook-generation-service-${{ inputs.tag }}.tar.gz
           target: ${{ secrets.SSH_TARGET_DIR || '/tts' }}
+        run: scp -o StrictHostKeyChecking=no -i "$key" ./audiobook-generation-service-${{ inputs.tag }}.tar.gz root@${{ secrets.SSH_HOST || '82.156.247.203' }}:${{ secrets.SSH_TARGET_DIR || '/tts' }}/
