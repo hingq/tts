@@ -46,7 +46,7 @@ jobs:
           retention-days: 7
 
       - name: Upload tar to remote server via SSH
-        with:
+        env:
           host: ${{ secrets.SSH_HOST || '82.156.247.203' }}
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT || '22' }}
