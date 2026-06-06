@@ -17,7 +17,7 @@
 export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'canceled';
 
 /** 任务所处的细分阶段，用于前端展示流水线进度。 */
-export type JobPhase = 'preprocess' | 'tts' | 'mux' | 'validating' | 'ready';
+export type JobPhase = 'preprocess' | 'tts' | 'mux' | 'uploading' | 'validating' | 'ready';
 
 /** 任务进度结构：当前阶段 + TTS/转码两条流水线的分块完成度。 */
 export interface JobProgress {
@@ -89,6 +89,8 @@ export interface JobState {
   chunks: ChunkState[];
   /** 失败原因，无错误时省略 */
   error?: string;
+  /** 成品在 COS 上的对象键；上传成功后写入，作为“下载走 COS 还是本地”的判据，未上传时省略 */
+  remoteKey?: string;
   /** 任务创建时间（ISO 8601） */
   createdAt: string;
   /** 最近一次状态落盘时间（ISO 8601），由 `saveJobState` 自动刷新 */

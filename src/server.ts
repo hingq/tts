@@ -14,10 +14,17 @@ import { startGarbageCollector } from './services/gc.js';
 import cors from '@fastify/cors';
 const fastify = Fastify({
   logger: {
-    transport: {
-      target: 'pino-pretty',
-      options: { translateTime: 'HH:MM:ss Z', ignore: 'pid,hostname' },
-    },
+    // pino-pretty 仅用于开发环境的可读日志，且是 devDependency；
+    // 生产镜像 npm ci --omit=dev 不会安装它，故此处按环境判断，
+    // 生产环境回退到 pino 默认 JSON 日志。
+    ...(config.NODE_ENV === 'production'
+      ? {}
+      : {
+          transport: {
+            target: 'pino-pretty',
+            options: { translateTime: 'HH:MM:ss Z', ignore: 'pid,hostname' },
+          },
+        }),
   },
 });
 

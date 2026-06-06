@@ -16,6 +16,8 @@ dotenv.config();
  * 全局配置接口定义
  */
 export interface Config {
+  /** 运行环境标识（development | production | test 等） */
+  NODE_ENV: string;
   /** 服务监听端口 */
   PORT: number;
   /** 服务绑定主机地址 */
@@ -42,6 +44,20 @@ export interface Config {
   FFMPEG_PATH: string;
   /** FFprobe 可执行二进制文件的系统路径 */
   FFPROBE_PATH: string;
+  /** 腾讯云 COS 永久密钥 SecretId（为空则不启用 COS，下载退回本地流式） */
+  COS_SECRET_ID: string;
+  /** 腾讯云 COS 永久密钥 SecretKey */
+  COS_SECRET_KEY: string;
+  /** COS 存储桶名，格式 `name-appid`（为空则不启用 COS 卸载） */
+  COS_BUCKET: string;
+  /** COS 存储桶所在地域，如 `ap-guangzhou` */
+  COS_REGION: string;
+  /** COS 对象键前缀，成品 key 为 `${COS_KEY_PREFIX}${jobId}.m4b` */
+  COS_KEY_PREFIX: string;
+  /** 下载预签名 URL 的有效期（秒） */
+  COS_PRESIGN_TTL_S: number;
+  /** 上传是否走内网域名（同地域 ECS 置 true 免费且不占公网带宽；非同地域本地开发置 false 走公网） */
+  COS_USE_INTERNAL_UPLOAD: boolean;
 }
 
 /**
@@ -77,6 +93,9 @@ if (!fs.existsSync(absoluteTmpRoot)) {
  * 全局只读配置对象实例
  */
 export const config: Config = {
+  // 运行环境标识，默认 development
+  NODE_ENV: process.env.NODE_ENV || 'development',
+
   // 服务监听端口，默认 3000
   PORT: parseNumber(process.env.PORT, 3000),
 
@@ -90,10 +109,13 @@ export const config: Config = {
   MAX_TEXT_SIZE_MB: parseNumber(process.env.MAX_TEXT_SIZE_MB, 5),
 
   // 全局最大并发运行任务数，默认 2
-  MAX_CONCURRENT_JOBS: parseNumber(process.env.MAX_CONCURRENT_JOBS, 2),
+  MAX_CONCURRENT_JOBS: parseNumber(
+    process.env.MAX_CONCURRENT_JOBS,
+    Math.max(1, os.cpus().length - 1),
+  ),
 
   // 微软 Edge TTS 引擎的并发请求上限，默认 2
-  CONCURRENT_TTS_LIMIT: parseNumber(process.env.CONCURRENT_TTS_LIMIT, 2),
+  CONCURRENT_TTS_LIMIT: parseNumber(process.env.CONCURRENT_TTS_LIMIT, 3),
 
   // FFmpeg 转码并发线程数上限，默认使用 CPU 核心数减一
   CONCURRENT_TRANSCODE_LIMIT: parseNumber(
@@ -118,4 +140,19 @@ export const config: Config = {
 
   // FFprobe 可执行二进制路径，默认 'ffprobe'
   FFPROBE_PATH: process.env.FFPROBE_PATH || 'ffprobe',
+
+  // 腾讯云 COS 凭证与桶信息（COS_BUCKET 为空时整个 COS 卸载禁用，下载退回本地流式）
+  COS_SECRET_ID: process.env.COS_SECRET_ID || '',
+  COS_SECRET_KEY: process.env.COS_SECRET_KEY || '',
+  COS_BUCKET: process.env.COS_BUCKET || '',
+  COS_REGION: process.env.COS_REGION || '',
+
+  // 对象键前缀，默认 'audiobooks/'
+  COS_KEY_PREFIX: process.env.COS_KEY_PREFIX || 'audiobooks/',
+
+  // 下载预签名 URL 有效期（秒），默认 3600（1小时）
+  COS_PRESIGN_TTL_S: parseNumber(process.env.COS_PRESIGN_TTL_S, 3600),
+
+  // 上传是否走内网域名，默认 true（生产同地域 ECS）；本地非同地域开发置 'false' 走公网
+  COS_USE_INTERNAL_UPLOAD: (process.env.COS_USE_INTERNAL_UPLOAD || 'true') !== 'false',
 };

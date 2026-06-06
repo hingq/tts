@@ -59,9 +59,19 @@ const mockManager = new (class extends EventEmitter {
   releaseSlot = vi.fn();
   createJob = vi.fn();
   getJob = vi.fn();
+  getRemoteKey = vi.fn();
+  listJobs = vi.fn();
+  uploadArtifact = vi.fn();
   cancelJob = vi.fn();
   resumeJob = vi.fn();
 })();
+
+// COS 卸载层桩：默认禁用；按用例驱动 getPresignedUrl 验证 302 跳转分支
+const mockObjectStore = vi.hoisted(() => ({
+  isEnabled: vi.fn(() => false),
+  getPresignedUrl: vi.fn(),
+}));
+vi.mock('../src/services/object-store.js', () => ({ objectStore: mockObjectStore }));
 
 vi.mock('../src/services/job-manager.js', () => {
   return {
@@ -418,6 +428,32 @@ describe('API Integration Tests', () => {
       expect(response.statusCode).toBe(404);
     });
 
+    it('已卸载到 COS（remoteKey 非空）：302 跳转到预签名 URL，不读本地文件', async () => {
+      mockManager.getJob.mockReturnValue({
+        jobId: 'cos-id',
+        status: 'done',
+        title: '云端书名',
+      });
+      mockManager.getRemoteKey.mockReturnValueOnce('audiobooks/cos-id.m4b');
+      mockObjectStore.getPresignedUrl.mockResolvedValueOnce(
+        'https://bucket.cos.ap-guangzhou.myqcloud.com/audiobooks/cos-id.m4b?sign=abc',
+      );
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/api/v1/jobs/cos-id/file',
+      });
+
+      expect(response.statusCode).toBe(302);
+      expect(response.headers.location).toContain('myqcloud.com');
+      expect(mockObjectStore.getPresignedUrl).toHaveBeenCalledWith(
+        'audiobooks/cos-id.m4b',
+        '云端书名.m4b',
+      );
+      // 走 COS 时不应触碰本地文件系统
+      expect(mocks.statSync).not.toHaveBeenCalled();
+    });
+
     describe('完整及 Partial Content Range 下载', () => {
       beforeEach(() => {
         mockManager.getJob.mockReturnValue({
@@ -599,6 +635,87 @@ describe('API Integration Tests', () => {
 
       expect(response.statusCode).toBe(400);
       expect(mockManager.releaseSlot).toHaveBeenCalled();
+    });
+  });
+
+  // ── 4.x 任务列表与手动上传 ─────────────────────────────────────
+
+  describe('GET /api/v1/jobs (任务列表)', () => {
+    it('返回任务概览数组', async () => {
+      const jobs = [
+        { jobId: 'a', status: 'done', phase: 'ready', title: '书A', uploaded: true, hasLocalFile: false },
+        { jobId: 'b', status: 'running', phase: 'tts', title: '书B', uploaded: false, hasLocalFile: true },
+      ];
+      mockManager.listJobs.mockResolvedValue(jobs);
+
+      const response = await app.inject({ method: 'GET', url: '/api/v1/jobs' });
+
+      expect(response.statusCode).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({ jobs });
+      expect(mockManager.listJobs).toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /api/v1/jobs/:jobId/upload (手动上传 COS)', () => {
+    it('上传成功返回 200 及 remoteKey', async () => {
+      mockManager.uploadArtifact.mockResolvedValue({
+        ok: true,
+        remoteKey: 'audiobooks/x.m4b',
+        alreadyUploaded: false,
+      });
+
+      const response = await app.inject({ method: 'POST', url: '/api/v1/jobs/x/upload' });
+
+      expect(response.statusCode).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({
+        jobId: 'x',
+        remoteKey: 'audiobooks/x.m4b',
+        alreadyUploaded: false,
+      });
+      expect(mockManager.uploadArtifact).toHaveBeenCalledWith('x');
+    });
+
+    it('已上传过则幂等返回 alreadyUploaded=true', async () => {
+      mockManager.uploadArtifact.mockResolvedValue({
+        ok: true,
+        remoteKey: 'audiobooks/x.m4b',
+        alreadyUploaded: true,
+      });
+
+      const response = await app.inject({ method: 'POST', url: '/api/v1/jobs/x/upload' });
+
+      expect(response.statusCode).toBe(200);
+      expect(JSON.parse(response.body).alreadyUploaded).toBe(true);
+    });
+
+    it('任务不存在返回 404', async () => {
+      mockManager.uploadArtifact.mockResolvedValue({ ok: false, reason: 'not_found' });
+      const response = await app.inject({ method: 'POST', url: '/api/v1/jobs/none/upload' });
+      expect(response.statusCode).toBe(404);
+    });
+
+    it('任务未完成返回 409', async () => {
+      mockManager.uploadArtifact.mockResolvedValue({ ok: false, reason: 'not_done' });
+      const response = await app.inject({ method: 'POST', url: '/api/v1/jobs/running/upload' });
+      expect(response.statusCode).toBe(409);
+    });
+
+    it('COS 未配置返回 409', async () => {
+      mockManager.uploadArtifact.mockResolvedValue({ ok: false, reason: 'cos_disabled' });
+      const response = await app.inject({ method: 'POST', url: '/api/v1/jobs/x/upload' });
+      expect(response.statusCode).toBe(409);
+    });
+
+    it('本地成品不存在返回 404', async () => {
+      mockManager.uploadArtifact.mockResolvedValue({ ok: false, reason: 'no_local_file' });
+      const response = await app.inject({ method: 'POST', url: '/api/v1/jobs/x/upload' });
+      expect(response.statusCode).toBe(404);
+    });
+
+    it('上传 I/O 失败抛错经全局处理器映射为 500', async () => {
+      mockManager.uploadArtifact.mockRejectedValue(new Error('COS 网络中断'));
+      const response = await app.inject({ method: 'POST', url: '/api/v1/jobs/x/upload' });
+      expect(response.statusCode).toBe(500);
     });
   });
 

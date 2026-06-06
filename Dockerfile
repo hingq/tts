@@ -44,11 +44,5 @@ USER node
 # Expose the application port
 EXPOSE 3000
 
-# Set default runtime environment variables
-ENV PORT=3000
-ENV HOST=0.0.0.0
-ENV TMP_ROOT=/tmp/audiobook
-ENV FFMPEG_PATH=ffmpeg
-ENV FFPROBE_PATH=ffprobe
 
 CMD ["node", "dist/server.js"]

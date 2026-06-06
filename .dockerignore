@@ -11,3 +11,4 @@ LICENSE
 tests
 *.log
 .env
+.tar

@@ -1,24 +1,22 @@
-version: '3.8'
-
 services:
   audiobook-service:
     build:
       context: .
       dockerfile: Dockerfile
-    image: audiobook-generation-service:latest
+    image: tts:latest
+    platform: linux/amd64
     container_name: audiobook
     restart: unless-stopped
     ports:
-      - "127.0.0.1:3000:3000"
+      - '127.0.0.1:3000:3000'
+    env_file:
+      - .env
     environment:
-      - PORT=3000
-      - HOST=0.0.0.0
-      - TMP_ROOT=/tmp/audiobook
+      - NODE_ENV=production
     env_file:
       - .env
     volumes:
       - tts-temp:/tmp/audiobook
-    platform: linux/amd64
 
 volumes:
   tts-temp:

@@ -11,6 +11,7 @@ import 'fastify-sse-v2';
 import fs from 'node:fs';
 import path from 'node:path';
 import { JobManager, JobCreationError } from '../services/job-manager.js';
+import { objectStore } from '../services/object-store.js';
 import { JobInfo } from '../types/job.js';
 import { config } from '../config.js';
 
@@ -209,6 +210,12 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     }
   });
 
+  /** 列出已有任务及状态（运维概览：含是否已上传 COS、本地是否仍有成品）。 */
+  fastify.get('/jobs', async (_request, reply) => {
+    const jobs = await manager.listJobs();
+    return reply.send({ jobs });
+  });
+
   /** 查询任务状态。 */
   fastify.get('/jobs/:jobId', async (request, reply) => {
     const { jobId } = request.params as { jobId: string };
@@ -341,6 +348,14 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       return reply.code(409).send({ error: 'Conflict', message: '任务尚未完成' });
     }
 
+    // 已卸载到 COS：302 跳转到限时预签名 URL，客户端直连 COS 出口下载，绕开本机 5M。
+    // Range/断点续传由 COS 原生支持。未上传（remoteKey 为空）则落到下方本地流式逻辑兜底。
+    const remoteKey = manager.getRemoteKey(jobId);
+    if (remoteKey) {
+      const url = await objectStore.getPresignedUrl(remoteKey, `${job.title || 'audiobook'}.m4b`);
+      return reply.redirect(url, 302);
+    }
+
     const filePath = path.join(config.TMP_ROOT, jobId, 'output.m4b');
     let size: number;
     try {
@@ -399,6 +414,36 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     const stream = fs.createReadStream(filePath);
     reply.raw.on('close', markDownloaded);
     return reply.send(stream);
+  });
+
+  /**
+   * 手动触发把成品上传到 COS（运维/补传）。幂等：已上传则原样返回既有 key。
+   * 内存中无此任务时会回落到磁盘加载，支持对重启后的历史任务补传。
+   */
+  fastify.post('/jobs/:jobId/upload', async (request, reply) => {
+    const { jobId } = request.params as { jobId: string };
+    const result = await manager.uploadArtifact(jobId);
+    if (!result.ok) {
+      switch (result.reason) {
+        case 'not_found':
+          return reply.code(404).send({ error: 'Not Found', message: '任务不存在' });
+        case 'not_done':
+          return reply.code(409).send({ error: 'Conflict', message: '任务尚未完成，无法上传' });
+        case 'cos_disabled':
+          return reply
+            .code(409)
+            .send({ error: 'Conflict', message: 'COS 未配置，无法上传（请设置 COS_BUCKET 等）' });
+        case 'no_local_file':
+          return reply
+            .code(404)
+            .send({ error: 'Not Found', message: '本地成品不存在，无法上传（可能已被回收）' });
+      }
+    }
+    return reply.send({
+      jobId,
+      remoteKey: result.remoteKey,
+      alreadyUploaded: result.alreadyUploaded,
+    });
   });
 
   /** 取消任务（对终态幂等）。 */

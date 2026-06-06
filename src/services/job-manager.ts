@@ -27,6 +27,7 @@ import { verifyDiskSpace } from '../utils/disk.js';
 // 模块 05（假定已存在）：把全部分片 M4A 合成为带章节/封面的 M4B，并完成完整性校验，
 // 失败时抛错。写出 `${jobDir}/output.m4b`。
 import { assembleAudiobook } from '../utils/ffmpeg.js';
+import { objectStore } from './object-store.js';
 import type { JobInfo, JobState } from '../types/job.js';
 
 /** 终态集合：处于这些状态的任务不再推进。 */
@@ -55,6 +56,36 @@ export interface CreateJobParams {
   rate: string;
   pitch: string;
   bitrate: string;
+}
+
+/**
+ * 手动上传（{@link JobManager.uploadArtifact}）的结果。供路由层映射为 HTTP 响应。
+ * - `ok: true` 上传成功或本就已上传（`alreadyUploaded`）；
+ * - `ok: false` 各前置条件未满足，`reason` 指明原因。
+ * 实际上传 I/O 失败由方法抛出（路由经全局错误处理器 → 500），不在此枚举内。
+ */
+export type UploadOutcome =
+  | { ok: true; remoteKey: string; alreadyUploaded: boolean }
+  | { ok: false; reason: 'not_found' | 'not_done' | 'cos_disabled' | 'no_local_file' };
+
+/** 任务列表项：供运维概览“已有 taskId 及状态”。 */
+export interface JobSummary {
+  /** 任务标识 */
+  jobId: string;
+  /** 整体状态 */
+  status: string;
+  /** 细分阶段 */
+  phase: string;
+  /** 书名 */
+  title: string;
+  /** 成品是否已上传 COS */
+  uploaded: boolean;
+  /** 本地是否仍有 output.m4b（可作下载兜底 / 可手动上传） */
+  hasLocalFile: boolean;
+  /** 创建时间（ISO 8601） */
+  createdAt: string;
+  /** 最近更新时间（ISO 8601） */
+  updatedAt: string;
 }
 
 export class JobManager extends EventEmitter {
@@ -120,6 +151,115 @@ export class JobManager extends EventEmitter {
   public getJob(jobId: string): JobInfo | undefined {
     const state = this.jobs.get(jobId);
     return state ? this.toJobInfo(state) : undefined;
+  }
+
+  /**
+   * 读取成品在 COS 上的对象键（内部细节，不进对外 {@link JobInfo}）。
+   * 下载路由据此决定走 COS 预签名跳转还是本地流式。
+   * @param jobId 任务标识
+   * @returns 已上传 COS 时返回对象键；未上传或任务不存在时返回 undefined
+   */
+  public getRemoteKey(jobId: string): string | undefined {
+    return this.jobs.get(jobId)?.remoteKey;
+  }
+
+  /**
+   * 上传成品到 COS 的核心步骤（不含前置校验）：上传 → 记录 `remoteKey` 落盘 →（可选）删本地大文件。
+   * 被自动流水线（{@link runJob}）与手动接口（{@link uploadArtifact}）共用，保证两条路径一致。
+   *
+   * @param state 任务状态（原地写入 `remoteKey`）
+   * @param jobDir 任务工作目录绝对路径
+   * @param deleteLocal 上传成功后是否删除本地 `output.m4b`（流水线置 true 省盘；手动置 false 保留兜底）
+   * @returns 上传后的 COS 对象键
+   * @throws 上传 I/O 失败时抛出
+   */
+  private async doUpload(state: JobState, jobDir: string, deleteLocal: boolean): Promise<string> {
+    const key = `${config.COS_KEY_PREFIX}${state.jobId}.m4b`;
+    await objectStore.uploadFile(path.join(jobDir, 'output.m4b'), key);
+    state.remoteKey = key;
+    await saveJobState(jobDir, state);
+    if (deleteLocal) {
+      // 删除失败忽略（如已不存在）：仍可由 GC 兜底
+      await fs.promises.unlink(path.join(jobDir, 'output.m4b')).catch(() => undefined);
+    }
+    return key;
+  }
+
+  /**
+   * 手动触发把某任务的成品上传到 COS（运维/补传用）。幂等：已上传则直接返回既有 key。
+   * 内存中无此任务时回落到磁盘 `state.json` 加载（支持重启后对历史任务补传）。
+   * 手动上传**保留**本地文件作下载兜底（与流水线自动上传后删除不同）。
+   *
+   * @param jobId 任务标识
+   * @returns {@link UploadOutcome}；实际上传失败则抛出（路由映射 500）
+   */
+  public async uploadArtifact(jobId: string): Promise<UploadOutcome> {
+    const jobDir = path.join(config.TMP_ROOT, jobId);
+    // 内存优先；缺失则尝试从磁盘恢复（历史 done 任务重启后不在内存）
+    let state = this.jobs.get(jobId);
+    if (!state) {
+      const loaded = await loadJobState(jobDir);
+      if (loaded) {
+        state = loaded;
+        this.jobs.set(jobId, state);
+      }
+    }
+    if (!state) return { ok: false, reason: 'not_found' };
+    if (state.status !== 'done') return { ok: false, reason: 'not_done' };
+    if (!objectStore.isEnabled()) return { ok: false, reason: 'cos_disabled' };
+    if (state.remoteKey) return { ok: true, remoteKey: state.remoteKey, alreadyUploaded: true };
+    if (!fs.existsSync(path.join(jobDir, 'output.m4b'))) {
+      return { ok: false, reason: 'no_local_file' };
+    }
+
+    const key = await this.doUpload(state, jobDir, false);
+    this.emitSnapshot(state);
+    return { ok: true, remoteKey: key, alreadyUploaded: false };
+  }
+
+  /**
+   * 列出已有任务及状态（运维概览）。合并内存与磁盘 `state.json`——内存视图更新更及时，
+   * 磁盘补全重启后不在内存的历史任务。按创建时间倒序返回。
+   */
+  public async listJobs(): Promise<JobSummary[]> {
+    const summaries = new Map<string, JobSummary>();
+
+    // 1. 磁盘：扫描 TMP_ROOT 一级子目录，补全历史任务
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(config.TMP_ROOT, { withFileTypes: true });
+    } catch {
+      // TMP_ROOT 不可读：仅返回内存视图
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const jobDir = path.join(config.TMP_ROOT, entry.name);
+      const state = await loadJobState(jobDir);
+      if (state) summaries.set(state.jobId, this.toSummary(state));
+    }
+
+    // 2. 内存：覆盖磁盘版本（运行中任务以内存为准）
+    for (const state of this.jobs.values()) {
+      summaries.set(state.jobId, this.toSummary(state));
+    }
+
+    return Array.from(summaries.values()).sort(
+      (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt),
+    );
+  }
+
+  /** 把 {@link JobState} 投影为列表项 {@link JobSummary}。 */
+  private toSummary(state: JobState): JobSummary {
+    return {
+      jobId: state.jobId,
+      status: state.status,
+      phase: state.phase,
+      title: state.title,
+      uploaded: Boolean(state.remoteKey),
+      hasLocalFile: fs.existsSync(path.join(config.TMP_ROOT, state.jobId, 'output.m4b')),
+      createdAt: state.createdAt,
+      updatedAt: state.updatedAt,
+    };
   }
 
   /**
@@ -265,6 +405,21 @@ export class JobManager extends EventEmitter {
       this.emitSnapshot(state);
       await assembleAudiobook(state, jobDir);
       if (isCanceled()) return;
+
+      // 阶段二·五：卸载成品到 COS（启用且尚未上传时）。上传走内网域名，快且不占公网 5M 出口。
+      // `!state.remoteKey` 保证重跑/恢复时幂等跳过；失败不致整任务失败——remoteKey 留空，下载回退本地流式。
+      if (objectStore.isEnabled() && !state.remoteKey) {
+        state.phase = 'uploading';
+        await saveJobState(jobDir, state);
+        this.emitSnapshot(state);
+        try {
+          await this.doUpload(state, jobDir, true);
+        } catch (uploadErr) {
+          // eslint-disable-next-line no-console
+          console.warn(`[job ${jobId}] COS 上传失败，回退本地下载：`, uploadErr);
+        }
+        if (isCanceled()) return;
+      }
 
       // 阶段三：校验已在 assembleAudiobook 内完成，此处推进至就绪
       state.phase = 'validating';
