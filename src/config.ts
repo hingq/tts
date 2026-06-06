@@ -58,6 +58,8 @@ export interface Config {
   COS_PRESIGN_TTL_S: number;
   /** 上传是否走内网域名（同地域 ECS 置 true 免费且不占公网带宽；非同地域本地开发置 false 走公网） */
   COS_USE_INTERNAL_UPLOAD: boolean;
+  /** 是否输出分片级（每个 chunk 的 TTS/转码）调试日志，默认 false，避免大任务刷屏 */
+  LOG_VERBOSE: boolean;
 }
 
 /**
@@ -155,4 +157,7 @@ export const config: Config = {
 
   // 上传是否走内网域名，默认 true（生产同地域 ECS）；本地非同地域开发置 'false' 走公网
   COS_USE_INTERNAL_UPLOAD: (process.env.COS_USE_INTERNAL_UPLOAD || 'true') !== 'false',
+
+  // 是否输出分片级调试日志（每个 chunk 的 TTS/转码开始与完成），默认关闭，避免数百分片刷屏
+  LOG_VERBOSE: true,
 };

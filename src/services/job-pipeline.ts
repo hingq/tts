@@ -86,6 +86,14 @@ export class JobPipeline {
     jobState.phase = 'tts';
     await saveJobState(jobDir, jobState);
 
+    const pending = jobState.chunks.filter(
+      (c) => c.status !== 'tts_done' && c.status !== 'transcode_done',
+    ).length;
+    // eslint-disable-next-line no-console
+    console.log(
+      `[job ${jobState.jobId}] 流水线启动：待处理 ${pending}/${jobState.totalChunks} 分片`,
+    );
+
     // 熔断状态：记录首个错误。任一分片失败后，尚未开始的分片应立即停止派发，
     // 不再发 TTS 请求 / spawn ffmpeg / 改写任务状态——避免“抛错后阶段一仍在继续”。
     let firstError: unknown;
@@ -122,7 +130,18 @@ export class JobPipeline {
     // 等待所有分片链条收口（含因 shouldStop() 立即返回者），不留孤儿任务在失败后改状态
     await Promise.all(chunkTasks);
     // 有失败则原样上抛，交由 runJob 置 failed 并经 SSE 推出 error
-    if (firstError !== undefined) throw firstError;
+    if (firstError !== undefined) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[job ${jobState.jobId}] 流水线失败：TTS=${jobState.completedTTS}/${jobState.totalChunks}，转码=${jobState.completedTranscode}/${jobState.totalChunks}`,
+        firstError,
+      );
+      throw firstError;
+    }
+    // eslint-disable-next-line no-console
+    console.log(
+      `[job ${jobState.jobId}] 流水线完成：TTS=${jobState.completedTTS}/${jobState.totalChunks}，转码=${jobState.completedTranscode}/${jobState.totalChunks}`,
+    );
   }
 
   /**
@@ -155,13 +174,28 @@ export class JobPipeline {
         jobState.completedTTS++;
         await saveJobState(jobDir, jobState);
         onProgress();
+        if (config.LOG_VERBOSE) {
+          // eslint-disable-next-line no-console
+          console.log(
+            `[job ${jobState.jobId} chunk ${chunk.index}] TTS 完成（${jobState.completedTTS}/${jobState.totalChunks}）`,
+          );
+        }
         return;
       } catch (err) {
         // 429 风控：触发全局冷却后重试（不计入失败），重试只会加剧风控故先等冷却
         if (err instanceof TTSThrottleError && attempt < MAX_THROTTLE_RETRIES) {
           this.triggerCooldown();
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[job ${jobState.jobId} chunk ${chunk.index}] 命中 429 风控，触发全局冷却 ${COOLDOWN_MS}ms，重试 ${attempt + 1}/${MAX_THROTTLE_RETRIES}`,
+          );
           continue;
         }
+        // eslint-disable-next-line no-console
+        console.error(
+          `[job ${jobState.jobId} chunk ${chunk.index}] TTS 最终失败（尝试 ${attempt + 1} 次）：`,
+          err,
+        );
         throw err;
       }
     }
@@ -176,6 +210,10 @@ export class JobPipeline {
     jobDir: string,
     onProgress: () => void,
   ): Promise<void> {
+    if (config.LOG_VERBOSE) {
+      // eslint-disable-next-line no-console
+      console.log(`[job ${jobState.jobId} chunk ${chunk.index}] 转码开始`);
+    }
     // 1. 标准化转码为 AAC/M4A（带子进程超时守护）
     await transcodeToM4A(chunk.rawPath, chunk.m4aPath, config.SUBPROCESS_TIMEOUT_MS);
     // 2. 读取精确时长（毫秒），供后续章节时间戳计算
@@ -184,6 +222,12 @@ export class JobPipeline {
     jobState.completedTranscode++;
     await saveJobState(jobDir, jobState);
     onProgress();
+    if (config.LOG_VERBOSE) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[job ${jobState.jobId} chunk ${chunk.index}] 转码完成（${jobState.completedTranscode}/${jobState.totalChunks}，时长=${chunk.durationMs}ms）`,
+      );
+    }
     // 3. 转码完成即删除临时 MP3，尽快压低峰值磁盘占用
     try {
       await fs.unlink(chunk.rawPath);

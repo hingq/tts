@@ -58,6 +58,8 @@ export function runCommandAsync(
 
     // 超时守卫：先 SIGTERM，100ms 后 SIGKILL 兜底
     const timer = setTimeout(() => {
+      // eslint-disable-next-line no-console
+      console.warn(`[subprocess] 超时 ${timeoutMs}ms，SIGKILL 终止：${command} ${args.join(' ')}`);
       child.kill('SIGKILL');
       reject(
         new Error(
@@ -79,6 +81,10 @@ export function runCommandAsync(
 
       if (exitCode !== 0) {
         const errorMsg = `Command failed with exit code ${exitCode}: ${command} ${args.join(' ')}\nstderr: ${stderr}`;
+        // eslint-disable-next-line no-console
+        console.error(
+          `[subprocess] 退出码 ${exitCode}：${command} ${args.join(' ')}\nstderr: ${stderr.slice(-500)}`,
+        );
         reject(new Error(errorMsg));
         return;
       }

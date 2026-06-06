@@ -94,6 +94,11 @@ export async function assembleAudiobook(state: JobState, jobDir: string): Promis
     .sort((a, b) => a[0] - b[0])
     .map((entry) => entry[1]);
 
+  // eslint-disable-next-line no-console
+  console.log(
+    `[job ${state.jobId}] 合成 M4B：分片=${state.chunks.length}，章节=${chapters.length}`,
+  );
+
   const metadata: AudiobookMetadata = {
     title: state.title,
     artist: state.author || 'Unknown',

@@ -13,8 +13,6 @@ services:
       - .env
     environment:
       - NODE_ENV=production
-    env_file:
-      - .env
     volumes:
       - tts-temp:/tmp/audiobook
 

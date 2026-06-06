@@ -175,6 +175,10 @@ export class EdgeTTSProvider implements TTSProvider {
         // 429 风控在本层不重试：立即转译为语义错误上抛，交由流水线触发全局冷却。
         // 该分支不消耗重试次数——重试只会加剧风控。
         if (isThrottleError(err)) {
+          if (config.LOG_VERBOSE) {
+            // eslint-disable-next-line no-console
+            console.warn(`[tts] 命中 429，转译为 TTSThrottleError 上抛（${audioPath}）`);
+          }
           throw new TTSThrottleError();
         }
 
@@ -187,6 +191,13 @@ export class EdgeTTSProvider implements TTSProvider {
         // 公式 2^retryCount * 1000 + Random(0,500) ms：指数项快速拉开重试间隔吸收抖动，
         // 抖动项打散并发请求的重试时刻、缓解惊群。
         const backoff = 2 ** retryCount * 1000 + Math.floor(Math.random() * 500);
+        if (config.LOG_VERBOSE) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[tts] 合成瞬时失败，第 ${retryCount + 1}/${MAX_RETRIES} 次重试，退避 ${backoff}ms（${audioPath}）：`,
+            err instanceof Error ? err.message : err,
+          );
+        }
         await delay(backoff);
       }
     }

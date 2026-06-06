@@ -16,7 +16,7 @@
   "dependencies": {
     "@fastify/cors": "^10",
     "@fastify/multipart": "^9",
-    "cos-nodejs-sdk-v5": "^2.15.4",
+    "cos-nodejs-sdk-v5": "^2.11.19",
     "dotenv": "^17.4.2",
     "fastify": "^5.8.5",
     "fastify-sse-v2": "^3.1.2",
