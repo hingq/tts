@@ -15,12 +15,15 @@ import { objectStore } from '../services/object-store.js';
 import { JobInfo } from '../types/job.js';
 import { config } from '../config.js';
 
-/** 合法发音人白名单（核心普通话音色）。 */
-const VOICE_WHITELIST = ['zh-CN-YunxiNeural', 'zh-CN-XiaoxiaoNeural', 'zh-CN-YunjianNeural'];
+/** 合法 TTS 引擎枚举（用于校验服务端 env 配置，非前端入参）。 */
+const ENGINE_WHITELIST = ['edge-tts', 'mimo-tts'];
+/** 按引擎划分的合法发音人白名单（用于校验服务端 env 配置，非前端入参）。 */
+const VOICE_WHITELIST: Record<string, string[]> = {
+  'edge-tts': ['zh-CN-YunxiNeural', 'zh-CN-XiaoxiaoNeural', 'zh-CN-YunjianNeural'],
+  'mimo-tts': ['苏打', '冰糖', '茉莉', '白桦', 'mimo_default'],
+};
 /** 合法码率枚举。 */
 const BITRATE_WHITELIST = ['32k', '64k', '128k'];
-/** 合法 TTS 引擎枚举。 */
-const ENGINE_WHITELIST = ['edge-tts'];
 const RATE_RE = /^[+-]\d+%$/;
 const PITCH_RE = /^[+-]\d+Hz$/;
 const COVER_MAX_BYTES = 2 * 1024 * 1024;
@@ -113,11 +116,13 @@ async function parseAndValidate(request: FastifyRequest): Promise<ParsedUpload> 
 
 /**
  * 校验文本字段并补默认值，返回 createMockJob 所需参数。
- * @throws HttpError 当任一字段非法
+ * 引擎（ttsEngine）与音色（voice）取自服务端环境变量，前端传入一律忽略。
+ * @throws HttpError 当任一字段非法（400），或服务端引擎/音色配置非法（500）
  */
 function buildJobParams(fields: Record<string, string>): {
   title: string;
   author?: string;
+  ttsEngine: string;
   voice: string;
   rate: string;
   pitch: string;
@@ -134,14 +139,21 @@ function buildJobParams(fields: Record<string, string>): {
     throw new HttpError(400, 'Bad Request', `author 长度不能超过 ${TITLE_MAX}`);
   }
 
-  const ttsEngine = fields.ttsEngine ?? 'edge-tts';
+  // 引擎与音色由服务端环境变量固定，前端不可选（fields.ttsEngine / fields.voice 被忽略）。
+  // 配置非法属于运维问题，按 500 暴露而非 400。
+  const ttsEngine = config.DEFAULT_TTS_ENGINE;
   if (!ENGINE_WHITELIST.includes(ttsEngine)) {
-    throw new HttpError(400, 'Bad Request', `不支持的 ttsEngine：${ttsEngine}`);
+    throw new HttpError(
+      500,
+      'Internal Server Error',
+      `服务端 DEFAULT_TTS_ENGINE 配置非法：${ttsEngine}`,
+    );
   }
 
-  const voice = fields.voice ?? 'zh-CN-YunxiNeural';
-  if (!VOICE_WHITELIST.includes(voice)) {
-    throw new HttpError(400, 'Bad Request', `voice 不在白名单内：${voice}`);
+  // 音色按引擎从各自的环境变量取（edge → EDGE_VOICE / mimo → MIMO_VOICE）
+  const voice = ttsEngine === 'mimo-tts' ? config.MIMO_VOICE : config.EDGE_VOICE;
+  if (!VOICE_WHITELIST[ttsEngine].includes(voice)) {
+    throw new HttpError(500, 'Internal Server Error', `服务端 ${ttsEngine} voice 配置非法：${voice}`);
   }
 
   const rate = fields.rate ?? '+0%';
@@ -155,7 +167,7 @@ function buildJobParams(fields: Record<string, string>): {
     throw new HttpError(400, 'Bad Request', `bitrate 非法：${bitrate}`);
   }
 
-  return { title, author, voice, rate, pitch, bitrate };
+  return { title, author, ttsEngine, voice, rate, pitch, bitrate };
 }
 
 const TERMINAL_STATES = ['done', 'failed', 'canceled'];

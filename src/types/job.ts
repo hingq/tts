@@ -71,11 +71,13 @@ export interface JobState {
   status: JobStatus;
   /** 当前细分阶段 */
   phase: JobPhase;
-  /** 发音人（白名单内） */
+  /** TTS 引擎标识，如 `edge-tts` / `mimo-tts` */
+  ttsEngine: string;
+  /** 发音人（对应引擎白名单内） */
   voice: string;
-  /** 语速，如 `+0%` */
+  /** 语速，如 `+0%`（mimo-tts 引擎忽略） */
   rate: string;
-  /** 音高，如 `+0Hz` */
+  /** 音高，如 `+0Hz`（mimo-tts 引擎忽略） */
   pitch: string;
   /** 目标音频码率，如 `64k` */
   bitrate: string;
@@ -117,11 +119,13 @@ export interface JobInfo {
   title: string;
   /** 作者，写入 M4B 元数据 Artist（可选） */
   author?: string;
-  /** 发音人（白名单内） */
+  /** TTS 引擎标识，如 `edge-tts` / `mimo-tts` */
+  ttsEngine: string;
+  /** 发音人（对应引擎白名单内） */
   voice: string;
-  /** 语速，如 `+0%` */
+  /** 语速，如 `+0%`（mimo-tts 引擎忽略） */
   rate: string;
-  /** 音高，如 `+0Hz` */
+  /** 音高，如 `+0Hz`（mimo-tts 引擎忽略） */
   pitch: string;
   /** 目标音频码率，如 `64k` */
   bitrate: string;

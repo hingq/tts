@@ -20,11 +20,14 @@
 import { promises as fs } from 'node:fs';
 import pLimit from 'p-limit';
 import { EdgeTTSProvider } from '../providers/edge-tts.js';
+import { MimoTTSProvider } from '../providers/mimo-tts.js';
 import { transcodeToM4A, getDuration } from '../utils/ffmpeg.js';
 import { saveJobState } from '../utils/state.js';
 import { TTSThrottleError } from '../types/tts.js';
+import type { TTSProvider } from '../types/tts.js';
 import type { JobState, ChunkState } from '../types/job.js';
 import { config } from '../config.js';
+import { logger } from '../utils/logger.js';
 
 /** 命中 429 风控后全局暂停派发新 TTS 请求的冷却时长（毫秒）。 */
 const COOLDOWN_MS = 30_000;
@@ -33,9 +36,9 @@ const COOLDOWN_MS = 30_000;
 const MAX_THROTTLE_RETRIES = 5;
 
 /** TTS 成功后插入的随机延时下界（毫秒），用于打散请求时刻避风控。 */
-const TTS_DELAY_MIN_MS = 1000;
+// const TTS_DELAY_MIN_MS = 1000;
 /** TTS 成功后随机延时的抖动幅度（毫秒），实际延时为 [1000, 2500)。 */
-const TTS_DELAY_JITTER_MS = 1500;
+// const TTS_DELAY_JITTER_MS = 1500;
 
 /** 等待指定毫秒。 */
 function delay(ms: number): Promise<void> {
@@ -47,12 +50,30 @@ function delay(ms: number): Promise<void> {
  * 因此 TTS 限额与 429 冷却对**所有**在跑任务统一生效，符合"全局风控"的语义。
  */
 export class JobPipeline {
-  /** TTS 合成并发池：限制对公网接口的在途请求数。 */
+  /** TTS 合成并发池：限制对公网接口的在途请求数。
+   * edge-tts比较容易出发429，所以要控制并发，同时
+   *
+   */
   private readonly ttsLimit = pLimit(config.CONCURRENT_TTS_LIMIT);
   /** 转码并发池：限制并发 FFmpeg 子进程数。 */
   private readonly transcodeLimit = pLimit(config.CONCURRENT_TRANSCODE_LIMIT);
-  /** TTS 合成器（实例复用，内部自带指数退避与 429 识别）。 */
-  private readonly ttsProvider = new EdgeTTSProvider();
+  /** 按引擎缓存的 TTS 合成器（实例复用，内部各自带指数退避与 429 识别）。 */
+  private readonly providers = new Map<string, TTSProvider>();
+
+  /**
+   * 按引擎标识惰性获取并缓存对应的 {@link TTSProvider}。
+   * 未知引擎回退为 Edge-TTS，保证向后兼容。
+   *
+   * @param engine 引擎标识，如 `edge-tts` / `mimo-tts`
+   */
+  private getProvider(engine: string): TTSProvider {
+    let provider = this.providers.get(engine);
+    if (!provider) {
+      provider = engine === 'mimo-tts' ? new MimoTTSProvider() : new EdgeTTSProvider();
+      this.providers.set(engine, provider);
+    }
+    return provider;
+  }
 
   /**
    * 全局 TTS 冷却的截止时间戳（epoch ms）。
@@ -89,8 +110,7 @@ export class JobPipeline {
     const pending = jobState.chunks.filter(
       (c) => c.status !== 'tts_done' && c.status !== 'transcode_done',
     ).length;
-    // eslint-disable-next-line no-console
-    console.log(
+    logger.info(
       `[job ${jobState.jobId}] 流水线启动：待处理 ${pending}/${jobState.totalChunks} 分片`,
     );
 
@@ -108,7 +128,8 @@ export class JobPipeline {
         if (chunk.status === 'transcode_done' || chunk.status === 'tts_done') return;
         await this.runTts(chunk, jobState, jobDir, onProgress);
         // TTS 成功后插入随机延时（[1000,2500)ms）打散请求时刻，缓解风控
-        await delay(TTS_DELAY_MIN_MS + Math.random() * TTS_DELAY_JITTER_MS);
+        // todo 删掉延迟
+        // await delay(TTS_DELAY_MIN_MS + Math.random() * TTS_DELAY_JITTER_MS);
       })
         .then(() =>
           // TTS 成功（或被跳过）后，立刻把该分片推入转码并发池——无需等待其它分片的 TTS
@@ -138,8 +159,7 @@ export class JobPipeline {
       );
       throw firstError;
     }
-    // eslint-disable-next-line no-console
-    console.log(
+    logger.info(
       `[job ${jobState.jobId}] 流水线完成：TTS=${jobState.completedTTS}/${jobState.totalChunks}，转码=${jobState.completedTranscode}/${jobState.totalChunks}`,
     );
   }
@@ -156,10 +176,11 @@ export class JobPipeline {
     jobDir: string,
     onProgress: () => void,
   ): Promise<void> {
+    const provider = this.getProvider(jobState.ttsEngine);
     for (let attempt = 0; attempt <= MAX_THROTTLE_RETRIES; attempt++) {
       await this.waitForCooldown();
       try {
-        await this.ttsProvider.synthesize(
+        const result = await provider.synthesize(
           chunk.text,
           {
             voice: jobState.voice,
@@ -167,9 +188,11 @@ export class JobPipeline {
             pitch: jobState.pitch,
             bitrate: jobState.bitrate,
           },
-          // 传入不带后缀的路径，由 Provider 自行拼接 .mp3
-          chunk.rawPath.replace(/\.mp3$/, ''),
+          // 传入不带后缀的路径，由 Provider 自行拼接扩展名（edge→.mp3 / mimo→.wav）
+          chunk.rawPath.replace(/\.(mp3|wav)$/i, ''),
         );
+        // 采用 Provider 返回的真实落盘路径（扩展名因引擎而异），供后续转码与清理读取
+        chunk.rawPath = result.audioPath;
         chunk.status = 'tts_done';
         jobState.completedTTS++;
         await saveJobState(jobDir, jobState);

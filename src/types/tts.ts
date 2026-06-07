@@ -30,7 +30,7 @@ export interface TTSOptions {
 export interface TTSResult {
   /** 本地暂存音频文件的绝对路径（含扩展名）。 */
   audioPath: string;
-  /** 输出音频格式扩展名，固定为 `"mp3"`。 */
+  /** 输出音频格式扩展名，如 `"mp3"`（Edge-TTS）/ `"wav"`（MiMo），由具体 Provider 决定。 */
   format: string;
 }
 
@@ -43,7 +43,7 @@ export interface TTSProvider {
    *
    * @param text 经过预处理的纯文本数据
    * @param options 音频控制参数（voice / rate / pitch / bitrate）
-   * @param outPathWithoutExt 不含扩展名的输出路径；由 Provider 自行拼接后缀（如 `.mp3`），
+   * @param outPathWithoutExt 不含扩展名的输出路径；由 Provider 自行拼接后缀（如 `.mp3` / `.wav`），
    *   文件名完全由调用方决定，而非底层库自行命名
    * @returns 落盘成功后的结果 `{ audioPath, format }`
    * @throws {TTSThrottleError} 命中 429 风控限流时抛出，交由上层流水线触发全局冷却

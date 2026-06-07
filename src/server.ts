@@ -12,6 +12,7 @@ import { JobManager } from './services/job-manager.js';
 import { validateFfmpegBinaries } from './services/audio-transcoder.js';
 import { startGarbageCollector } from './services/gc.js';
 import cors from '@fastify/cors';
+import { logger } from './utils/logger.js';
 const fastify = Fastify({
   logger: {
     // pino-pretty 仅用于开发环境的可读日志，且是 devDependency；
@@ -93,7 +94,7 @@ async function shutdown(exitCode: number, reason: string): Promise<never> {
   isShuttingDown = true;
   shuttingDown = true;
 
-  console.error(`[shutdown] reason=${reason}, exitCode=${exitCode}`);
+  logger.error(`[shutdown] reason=${reason}, exitCode=${exitCode}`);
 
   if (gcTimer) {
     clearInterval(gcTimer);
@@ -103,7 +104,7 @@ async function shutdown(exitCode: number, reason: string): Promise<never> {
   try {
     JobManager.getInstance().clearAllTimers();
   } catch (e) {
-    console.error('[shutdown] JobManager.clearAllTimers() error:', e);
+    logger.error('[shutdown] JobManager.clearAllTimers() error:', e);
   }
 
   try {
@@ -115,10 +116,10 @@ async function shutdown(exitCode: number, reason: string): Promise<never> {
       ),
     ]);
   } catch (e) {
-    console.error('[shutdown] fastify.close() error:', e);
+    logger.error('[shutdown] fastify.close() error:', e);
   }
 
-  console.error(`[shutdown] calling process.exit(${exitCode})`);
+  logger.error(`[shutdown] calling process.exit(${exitCode})`);
 
   process.exit(exitCode);
 }
@@ -137,7 +138,7 @@ const start = async (): Promise<void> => {
     await fastify.listen({ port: config.PORT, host: config.HOST });
     fastify.log.info(`Server is listening on http://${config.HOST}:${config.PORT}`);
   } catch (err) {
-    console.error('Failed to start server:', err);
+    logger.error('Failed to start server:', err);
     await shutdown(1, 'start() failed');
   }
 };

@@ -29,6 +29,7 @@ import { verifyDiskSpace } from '../utils/disk.js';
 import { assembleAudiobook } from '../utils/ffmpeg.js';
 import { objectStore } from './object-store.js';
 import type { JobInfo, JobState } from '../types/job.js';
+import { logger } from '../utils/logger.js';
 
 /** 终态集合：处于这些状态的任务不再推进。 */
 const TERMINAL_STATES: ReadonlyArray<string> = ['done', 'failed', 'canceled'];
@@ -52,6 +53,7 @@ export class JobCreationError extends Error {
 export interface CreateJobParams {
   title: string;
   author?: string;
+  ttsEngine: string;
   voice: string;
   rate: string;
   pitch: string;
@@ -175,13 +177,12 @@ export class JobManager extends EventEmitter {
    */
   private async doUpload(state: JobState, jobDir: string, deleteLocal: boolean): Promise<string> {
     const key = `${config.COS_KEY_PREFIX}${state.jobId}.m4b`;
-    // eslint-disable-next-line no-console
-    console.log(`[job ${state.jobId}] 开始上传成品到 COS：key=${key}`);
+    logger.info(`[job ${state.jobId}] 开始上传成品到 COS：key=${key}`);
     await objectStore.uploadFile(path.join(jobDir, 'output.m4b'), key);
     state.remoteKey = key;
     await saveJobState(jobDir, state);
     // eslint-disable-next-line no-console
-    console.log(`[job ${state.jobId}] COS 上传成功：key=${key}，删除本地=${deleteLocal}`);
+    logger.info(`[job ${state.jobId}] COS 上传成功：key=${key}，删除本地=${deleteLocal}`);
     if (deleteLocal) {
       // 删除失败忽略（如已不存在）：仍可由 GC 兜底
       await fs.promises.unlink(path.join(jobDir, 'output.m4b')).catch(() => undefined);
@@ -286,6 +287,7 @@ export class JobManager extends EventEmitter {
       finishedAt: terminal ? state.updatedAt : null,
       title: state.title,
       author: state.author,
+      ttsEngine: state.ttsEngine,
       voice: state.voice,
       rate: state.rate,
       pitch: state.pitch,
@@ -320,6 +322,7 @@ export class JobManager extends EventEmitter {
   ): Promise<JobInfo> {
     const jobId = randomUUID();
     const jobDir = path.join(config.TMP_ROOT, jobId);
+    // todo：移到前端处理分片
     // 1. 文本预处理：切分为 TTS 分块。
     //    注意：以下校验若抛错，并发名额仍为“预留”状态，由路由层 catch 归还，避免重复释放。
     const ttsChunks = processText(text);
@@ -327,8 +330,7 @@ export class JobManager extends EventEmitter {
       throw new JobCreationError(400, 'Bad Request', '文本内容为空或无法切分出有效分片');
     }
 
-    // eslint-disable-next-line no-console
-    console.log(
+    logger.info(
       `[job ${jobId}] 创建任务：title=${params.title}，文本=${text.length}B，分片=${ttsChunks.length}`,
     );
 
@@ -336,8 +338,7 @@ export class JobManager extends EventEmitter {
     fs.mkdirSync(jobDir, { recursive: true });
     if (!(await verifyDiskSpace(jobDir, ttsChunks.length))) {
       fs.rmSync(jobDir, { recursive: true, force: true });
-      // eslint-disable-next-line no-console
-      console.warn(`[job ${jobId}] 磁盘可用空间不足，拒绝创建（分片=${ttsChunks.length}）`);
+      logger.error(`[job ${jobId}] 磁盘可用空间不足，拒绝创建（分片=${ttsChunks.length}）`);
       throw new JobCreationError(507, 'Insufficient Storage', '磁盘可用空间不足以容纳本次任务');
     }
 
@@ -347,8 +348,7 @@ export class JobManager extends EventEmitter {
         fs.writeFileSync(path.join(jobDir, `cover${coverExtension}`), cover);
       } catch (error) {
         fs.rmSync(jobDir, { recursive: true, force: true });
-        // eslint-disable-next-line no-console
-        console.error(`[job ${jobId}] 保存封面图片失败：`, error);
+        logger.error(`[job ${jobId}] 保存封面图片失败：`, error);
         throw new JobCreationError(500, 'Internal Server Error', '保存封面图片失败');
       }
     }
@@ -364,6 +364,7 @@ export class JobManager extends EventEmitter {
       author: params.author,
       status: 'pending',
       phase: 'preprocess',
+      ttsEngine: params.ttsEngine,
       voice: params.voice,
       rate: params.rate,
       pitch: params.pitch,
@@ -389,7 +390,7 @@ export class JobManager extends EventEmitter {
     await saveJobState(jobDir, state);
     this.emitSnapshot(state);
 
-    // 4. 后台执行（不阻塞创建响应）
+    //  后台执行（不阻塞创建响应）
     void this.runJob(jobId, jobDir);
     return this.toJobInfo(state);
   }
@@ -407,8 +408,7 @@ export class JobManager extends EventEmitter {
     // 取消查询钩子：以内存中的最新状态为准，使流水线内尚未开始的分片能及时跳过
     const isCanceled = (): boolean => this.jobs.get(jobId)?.status === 'canceled';
 
-    // eslint-disable-next-line no-console
-    console.log(`[job ${jobId}] 开始执行流水线，共 ${state.totalChunks} 分片`);
+    logger.info(`[job ${jobId}] 开始执行流水线，共 ${state.totalChunks} 分片`);
 
     try {
       // 阶段一：TTS 合成 + 逐分片转码（双并发池流水线）
@@ -419,24 +419,21 @@ export class JobManager extends EventEmitter {
       state.phase = 'mux';
       await saveJobState(jobDir, state);
       this.emitSnapshot(state);
-      // eslint-disable-next-line no-console
-      console.log(`[job ${jobId}] 阶段 -> mux：合成 M4B`);
+      logger.info(`[job ${jobId}] 阶段 -> mux：合成 M4B`);
       await assembleAudiobook(state, jobDir);
       if (isCanceled()) return;
 
-      // 阶段二·五：卸载成品到 COS（启用且尚未上传时）。上传走内网域名，快且不占公网 5M 出口。
+      // 阶段二·卸载成品到 COS（启用且尚未上传时）。上传走内网域名，快且不占公网出口。
       // `!state.remoteKey` 保证重跑/恢复时幂等跳过；失败不致整任务失败——remoteKey 留空，下载回退本地流式。
       if (objectStore.isEnabled() && !state.remoteKey) {
         state.phase = 'uploading';
         await saveJobState(jobDir, state);
         this.emitSnapshot(state);
-        // eslint-disable-next-line no-console
-        console.log(`[job ${jobId}] 阶段 -> uploading：卸载成品到 COS`);
+        logger.info(`[job ${jobId}] 阶段 -> uploading：卸载成品到 COS`);
         try {
           await this.doUpload(state, jobDir, true);
         } catch (uploadErr) {
-          // eslint-disable-next-line no-console
-          console.warn(`[job ${jobId}] COS 上传失败，回退本地下载：`, uploadErr);
+          logger.info(`[job ${jobId}] COS 上传失败，回退本地下载：`, uploadErr);
         }
         if (isCanceled()) return;
       }
@@ -451,16 +448,14 @@ export class JobManager extends EventEmitter {
       state.status = 'done';
       await saveJobState(jobDir, state);
       this.emitSnapshot(state);
-      // eslint-disable-next-line no-console
-      console.log(`[job ${jobId}] 任务完成（done）`);
+      logger.info(`[job ${jobId}] 任务完成（done）`);
     } catch (err) {
       // 被取消导致的抛错不视为失败
       if (isCanceled()) return;
       state.status = 'failed';
       state.error = err instanceof Error ? err.message : String(err);
       // 记录失败时所处阶段与完整错误（含堆栈），便于定位卡在哪一步
-      // eslint-disable-next-line no-console
-      console.error(`[job ${jobId}] 任务失败 @phase=${state.phase}：`, err);
+      logger.error(`[job ${jobId}] 任务失败 @phase=${state.phase}：`, err);
       await saveJobState(jobDir, state).catch(() => undefined);
       this.emitSnapshot(state);
     }

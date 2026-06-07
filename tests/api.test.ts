@@ -10,6 +10,7 @@ import multipart from '@fastify/multipart';
 import { FastifySSEPlugin } from 'fastify-sse-v2';
 import cors from '@fastify/cors';
 import { registerRoutes } from '../src/routes/jobs.js';
+import { config } from '../src/config.js';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 
@@ -145,6 +146,8 @@ describe('API Integration Tests', () => {
 
   afterEach(async () => {
     await app.close();
+    // 还原可能被用例临时改写的全局引擎配置
+    config.DEFAULT_TTS_ENGINE = 'edge-tts';
   });
 
   // ── 4.1 创建任务接口 ─────────────────────────────────────────
@@ -160,8 +163,9 @@ describe('API Integration Tests', () => {
         downloadUrl: null,
       });
 
+      // 前端不再传引擎/音色，仅传 title；引擎与音色取自服务端 env 默认值
       const body = buildMultipartBody(
-        { title: '测试书', voice: 'zh-CN-YunxiNeural' },
+        { title: '测试书' },
         [{ name: 'text', filename: 'text.txt', mimetype: 'text/plain', data: '小说正文内容。' }],
         boundary,
       );
@@ -184,6 +188,7 @@ describe('API Integration Tests', () => {
       expect(mockManager.createJob).toHaveBeenCalledWith(
         expect.objectContaining({
           title: '测试书',
+          ttsEngine: 'edge-tts',
           voice: 'zh-CN-YunxiNeural',
         }),
         expect.any(Buffer),
@@ -243,11 +248,17 @@ describe('API Integration Tests', () => {
       expect(mockManager.releaseSlot).toHaveBeenCalled();
     });
 
-    it('发音人不在白名单返回 400 Bad Request', async () => {
+    it('前端传入的 ttsEngine / voice 被忽略，仍采用 env 配置', async () => {
       mockManager.tryReserveSlot.mockReturnValue(true);
+      mockManager.createJob.mockResolvedValue({
+        jobId: 'test-uuid-ignored',
+        status: 'pending',
+        downloadUrl: null,
+      });
 
+      // 前端即便传非法引擎/音色也应被忽略，最终采用 env（edge-tts / zh-CN-YunxiNeural）
       const body = buildMultipartBody(
-        { title: '测试书', voice: 'zh-CN-IllegalVoice' },
+        { title: '测试书', ttsEngine: 'mimo-tts', voice: 'zh-CN-IllegalVoice' },
         [{ name: 'text', filename: 'text.txt', mimetype: 'text/plain', data: '正文' }],
         boundary,
       );
@@ -261,9 +272,65 @@ describe('API Integration Tests', () => {
         payload: body,
       });
 
-      expect(response.statusCode).toBe(400);
-      const json = JSON.parse(response.body);
-      expect(json.message).toContain('voice 不在白名单内');
+      expect(response.statusCode).toBe(201);
+      expect(mockManager.createJob).toHaveBeenCalledWith(
+        expect.objectContaining({ ttsEngine: 'edge-tts', voice: 'zh-CN-YunxiNeural' }),
+        expect.any(Buffer),
+        undefined,
+        undefined,
+      );
+    });
+
+    it('env 设为 mimo-tts 时使用 mimo 引擎与 MIMO_VOICE 音色创建任务', async () => {
+      config.DEFAULT_TTS_ENGINE = 'mimo-tts';
+      mockManager.tryReserveSlot.mockReturnValue(true);
+      mockManager.createJob.mockResolvedValue({
+        jobId: 'test-uuid-mimo',
+        status: 'pending',
+        downloadUrl: null,
+      });
+
+      const body = buildMultipartBody(
+        { title: '测试书' },
+        [{ name: 'text', filename: 'text.txt', mimetype: 'text/plain', data: '小说正文内容。' }],
+        boundary,
+      );
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/v1/jobs',
+        headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+        payload: body,
+      });
+
+      expect(response.statusCode).toBe(201);
+      expect(mockManager.createJob).toHaveBeenCalledWith(
+        expect.objectContaining({ ttsEngine: 'mimo-tts', voice: config.MIMO_VOICE }),
+        expect.any(Buffer),
+        undefined,
+        undefined,
+      );
+    });
+
+    it('服务端 DEFAULT_TTS_ENGINE 配置非法返回 500', async () => {
+      config.DEFAULT_TTS_ENGINE = 'bogus-engine';
+      mockManager.tryReserveSlot.mockReturnValue(true);
+
+      const body = buildMultipartBody(
+        { title: '测试书' },
+        [{ name: 'text', filename: 'text.txt', mimetype: 'text/plain', data: '正文' }],
+        boundary,
+      );
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/v1/jobs',
+        headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+        payload: body,
+      });
+
+      expect(response.statusCode).toBe(500);
+      expect(JSON.parse(response.body).message).toContain('DEFAULT_TTS_ENGINE');
       expect(mockManager.releaseSlot).toHaveBeenCalled();
     });
 

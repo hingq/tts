@@ -32,14 +32,26 @@ export interface Config {
   CONCURRENT_TTS_LIMIT: number;
   /** FFmpeg 转码的并发线程上限 */
   CONCURRENT_TRANSCODE_LIMIT: number;
-  /** 默认的语音合成引擎（如 'edge-tts'） */
+  /** 全局语音合成引擎（'edge-tts' | 'mimo-tts'），由服务端固定，前端不可选 */
   DEFAULT_TTS_ENGINE: string;
+  /** edge-tts 引擎使用的音色（白名单内），默认 `zh-CN-YunxiNeural` */
+  EDGE_VOICE: string;
   /** 单个子进程（如转码）执行的超时时间（单位: 毫秒） */
   SUBPROCESS_TIMEOUT_MS: number;
   /** 整个有声书生成任务的全局超时时间（单位: 毫秒） */
   GLOBAL_TASK_TIMEOUT_MS: number;
   /** 合成语音请求时使用的 HTTP 代理网关地址（可选） */
   TTS_PROXY?: string;
+  /** 小米 MiMo 开放平台 API Key（mimo-tts 引擎认证用，留空则该引擎不可用） */
+  MIMO_API_KEY: string;
+  /** MiMo OpenAI 兼容接口基址，默认 `https://api.xiaomimimo.com/v1` */
+  MIMO_BASE_URL: string;
+  /** MiMo TTS 模型 ID，默认 `mimo-v2.5-tts`（预置音色） */
+  MIMO_MODEL: string;
+  /** mimo-tts 引擎缺省音色（白名单内），默认 `苏打` */
+  MIMO_VOICE: string;
+  /** MiMo 请求 messages 中 user 角色的风格指令，默认中性旁白语气 */
+  MIMO_STYLE_PROMPT: string;
   /** FFmpeg 可执行二进制文件的系统路径 */
   FFMPEG_PATH: string;
   /** FFprobe 可执行二进制文件的系统路径 */
@@ -125,8 +137,11 @@ export const config: Config = {
     Math.max(1, os.cpus().length - 1),
   ),
 
-  // 默认的语音合成引擎，默认使用 edge-tts
-  DEFAULT_TTS_ENGINE: process.env.DEFAULT_TTS_ENGINE || 'edge-tts',
+  // 全局语音合成引擎（前端不可选），默认 edge-tts
+  DEFAULT_TTS_ENGINE: process.env.DEFAULT_TTS_ENGINE || 'mimo-tts',
+
+  // edge-tts 引擎使用的音色，默认 zh-CN-YunxiNeural
+  EDGE_VOICE: process.env.EDGE_VOICE || 'zh-CN-YunxiNeural',
 
   // 单个子进程（如转码）执行超时时间（单位: 毫秒），默认 60000（1分钟）
   SUBPROCESS_TIMEOUT_MS: parseNumber(process.env.SUBPROCESS_TIMEOUT_MS, 60000),
@@ -136,6 +151,13 @@ export const config: Config = {
 
   // 合成语音请求时使用的 HTTP 代理网关地址，非必填
   TTS_PROXY: process.env.TTS_PROXY || undefined,
+
+  // 小米 MiMo 开放平台配置（MIMO_API_KEY 为空则 mimo-tts 引擎不可用）
+  MIMO_API_KEY: process.env.MIMO_API_KEY || '',
+  MIMO_BASE_URL: process.env.MIMO_BASE_URL || 'https://api.xiaomimimo.com/v1',
+  MIMO_MODEL: process.env.MIMO_MODEL || 'mimo-v2.5-tts',
+  MIMO_VOICE: process.env.MIMO_VOICE || '苏打',
+  MIMO_STYLE_PROMPT: process.env.MIMO_STYLE_PROMPT || '平稳、自然、清晰的旁白朗读语气',
 
   // FFmpeg 可执行二进制路径，默认 'ffmpeg'
   FFMPEG_PATH: process.env.FFMPEG_PATH || 'ffmpeg',

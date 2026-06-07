@@ -21,6 +21,7 @@ import {
 } from '../services/audio-transcoder.js';
 import type { JobState } from '../types/job.js';
 import type { AudiobookMetadata } from '../types/audio-transcoder.js';
+import { logger } from './logger.js';
 
 /**
  * 将单个原始音频段转码为标准化 M4A（AAC）文件，带超时守护与单线程 CPU 优化限制。
@@ -36,14 +37,22 @@ export async function transcodeToM4A(
 ): Promise<void> {
   const args = [
     '-y',
-    '-i', rawPath,
-    '-c:a', 'aac',
-    '-profile:a', 'aac_low',
-    '-b:a', '64k',
-    '-ar', '24000',
-    '-ac', '1',
-    '-threads', '1', // 限制单线程，防止高并发时瞬间压爆 CPU
-    '-movflags', '+faststart',
+    '-i',
+    rawPath,
+    '-c:a',
+    'aac',
+    '-profile:a',
+    'aac_low',
+    '-b:a',
+    '64k',
+    '-ar',
+    '24000',
+    '-ac',
+    '1',
+    '-threads',
+    '1', // 限制单线程，防止高并发时瞬间压爆 CPU
+    '-movflags',
+    '+faststart',
     m4aPath,
   ];
   await runCommandAsync(config.FFMPEG_PATH, args, timeoutMs);
@@ -94,8 +103,7 @@ export async function assembleAudiobook(state: JobState, jobDir: string): Promis
     .sort((a, b) => a[0] - b[0])
     .map((entry) => entry[1]);
 
-  // eslint-disable-next-line no-console
-  console.log(
+  logger.info(
     `[job ${state.jobId}] 合成 M4B：分片=${state.chunks.length}，章节=${chapters.length}`,
   );
 
