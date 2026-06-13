@@ -11,7 +11,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // ─── 提升 mock 桩 ───────────────────────────────────────────────
 
 const mocks = vi.hoisted(() => ({
-  processText: vi.fn(),
   verifyDiskSpace: vi.fn(),
   saveJobState: vi.fn(),
   loadJobState: vi.fn(),
@@ -20,6 +19,9 @@ const mocks = vi.hoisted(() => ({
   randomUUID: vi.fn(),
   mkdirSync: vi.fn(),
   rmSync: vi.fn(),
+  writeFileSync: vi.fn(),
+  cosIsEnabled: vi.fn(),
+  cosUploadFile: vi.fn(),
 }));
 
 // ─── vi.mock 各依赖模块 ─────────────────────────────────────────
@@ -31,11 +33,16 @@ vi.mock('../../src/config.js', () => ({
     CONCURRENT_TTS_LIMIT: 2,
     CONCURRENT_TRANSCODE_LIMIT: 2,
     SUBPROCESS_TIMEOUT_MS: 60000,
+    COS_UPLOAD_ENABLED: false,
+    COS_KEY_PREFIX: 'audiobooks/',
   },
 }));
 
-vi.mock('../../src/services/text-processor.js', () => ({
-  processText: mocks.processText,
+vi.mock('../../src/services/object-store.js', () => ({
+  objectStore: {
+    isEnabled: mocks.cosIsEnabled,
+    uploadFile: mocks.cosUploadFile,
+  },
 }));
 
 vi.mock('../../src/utils/disk.js', () => ({
@@ -73,6 +80,7 @@ vi.mock('node:fs', async (importOriginal) => {
       ...actual,
       mkdirSync: mocks.mkdirSync,
       rmSync: mocks.rmSync,
+      writeFileSync: mocks.writeFileSync,
     },
   };
 });
@@ -80,6 +88,7 @@ vi.mock('node:fs', async (importOriginal) => {
 // ─── 被测模块（必须在 mock 之后导入） ───────────────────────────
 
 import { JobManager, JobCreationError } from '../../src/services/job-manager.js';
+import { config } from '../../src/config.js';
 
 // ─── 辅助函数 ────────────────────────────────────────────────────
 
@@ -93,11 +102,28 @@ function resetManager(manager: JobManager): void {
 function makeCreateParams() {
   return {
     title: '测试书',
+    ttsEngine: 'edge-tts',
     voice: 'zh-CN-YunxiNeural',
     rate: '+0%',
     pitch: '+0Hz',
     bitrate: '64k',
   };
+}
+
+/** 构造 n 片示例分片（前端切分结果）。 */
+function makeChunks(n: number) {
+  return Array.from({ length: n }, (_, i) => ({
+    index: i,
+    chapterIndex: 0,
+    chapterTitle: '第一章',
+    text: `分片${i}`,
+  }));
+}
+
+/** 单次 createJob：携带全部分片直接创建并启动流水线，返回 jobId。 */
+async function createAndRun(manager: JobManager, totalChunks = 2): Promise<string> {
+  const job = await manager.createJob(makeCreateParams(), makeChunks(totalChunks));
+  return job.jobId;
 }
 
 // ─── 测试 ────────────────────────────────────────────────────────
@@ -110,17 +136,15 @@ describe('JobManager', () => {
     resetManager(manager);
     vi.clearAllMocks();
 
-    // 默认：processText 返回 2 个分片
-    mocks.processText.mockReturnValue([
-      { index: 0, chapterIndex: 0, chapterTitle: '第一章', text: '分片0', charCount: 3 },
-      { index: 1, chapterIndex: 0, chapterTitle: '第一章', text: '分片1', charCount: 3 },
-    ]);
     mocks.verifyDiskSpace.mockResolvedValue(true);
     mocks.saveJobState.mockResolvedValue(undefined);
     mocks.loadJobState.mockResolvedValue(null);
     mocks.pipelineExecute.mockResolvedValue(undefined);
     mocks.assembleAudiobook.mockResolvedValue(undefined);
     mocks.randomUUID.mockReturnValue('test-uuid-1234');
+    mocks.cosIsEnabled.mockReturnValue(true);
+    mocks.cosUploadFile.mockResolvedValue(undefined);
+    config.COS_UPLOAD_ENABLED = false;
   });
 
   afterEach(() => {
@@ -130,23 +154,39 @@ describe('JobManager', () => {
   // ── 3.1 状态机切换 ──────────────────────────────────────────
 
   describe('状态机变化', () => {
-    it('createJob 创建 pending 状态任务并落盘', async () => {
-      // 先占位
+    it('createJob 直接创建 running/tts 任务、写入分片并落盘', async () => {
+      // pipeline 不完成，便于观察创建后的初始态
+      mocks.pipelineExecute.mockImplementation(() => new Promise(() => {}));
       expect(manager.tryReserveSlot()).toBe(true);
 
-      const job = await manager.createJob(makeCreateParams(), Buffer.from('文本内容'));
+      const job = await manager.createJob(makeCreateParams(), makeChunks(2));
 
       expect(job.jobId).toBe('test-uuid-1234');
-      expect(job.status).toBe('pending');
+      expect(job.status).toBe('running');
+      expect(job.progress.phase).toBe('tts');
+      expect(job.progress.ttsChunks.total).toBe(2);
       // saveJobState 至少被调用一次（初始落盘）
       expect(mocks.saveJobState).toHaveBeenCalled();
     });
 
-    it('任务跑完流水线后变为 done', async () => {
+    it('单片任务：携带真实 index 的单个分片可创建并跑完', async () => {
+      // 一个切片一个任务：分片保留其在整本中的真实序号（如 57）
+      expect(manager.tryReserveSlot()).toBe(true);
+      const job = await manager.createJob(makeCreateParams(), [
+        { index: 57, chapterIndex: 0, chapterTitle: '第十章', text: '单片正文' },
+      ]);
+
+      await vi.waitFor(() => {
+        const j = manager.getJob(job.jobId);
+        expect(j?.status).toBe('done');
+        expect(j?.progress.ttsChunks.total).toBe(1);
+      });
+    });
+
+    it('createJob 跑完流水线变为 done', async () => {
       // pipeline 和 assembleAudiobook 都成功 → 应推进到 done
       expect(manager.tryReserveSlot()).toBe(true);
-
-      await manager.createJob(makeCreateParams(), Buffer.from('文本内容'));
+      await createAndRun(manager, 2);
 
       // 等 runJob 的 microtask 推进
       await vi.waitFor(() => {
@@ -158,13 +198,38 @@ describe('JobManager', () => {
     it('流水线异常时状态变为 failed', async () => {
       mocks.pipelineExecute.mockRejectedValue(new Error('TTS 故障'));
       expect(manager.tryReserveSlot()).toBe(true);
-
-      await manager.createJob(makeCreateParams(), Buffer.from('文本'));
+      await createAndRun(manager, 2);
 
       await vi.waitFor(() => {
         const job = manager.getJob('test-uuid-1234');
         expect(job?.status).toBe('failed');
       });
+    });
+  });
+
+  // ── COS 卸载开关 ──────────────────────────────────────────
+
+  describe('COS 卸载开关 (COS_UPLOAD_ENABLED)', () => {
+    it('默认关闭时即使 COS 已配置也不调用 uploadFile', async () => {
+      config.COS_UPLOAD_ENABLED = false;
+      expect(manager.tryReserveSlot()).toBe(true);
+      await createAndRun(manager, 2);
+
+      await vi.waitFor(() => {
+        expect(manager.getJob('test-uuid-1234')?.status).toBe('done');
+      });
+      expect(mocks.cosUploadFile).not.toHaveBeenCalled();
+    });
+
+    it('开关开启且 COS 已配置时卸载成品到 COS', async () => {
+      config.COS_UPLOAD_ENABLED = true;
+      expect(manager.tryReserveSlot()).toBe(true);
+      await createAndRun(manager, 2);
+
+      await vi.waitFor(() => {
+        expect(manager.getJob('test-uuid-1234')?.status).toBe('done');
+      });
+      expect(mocks.cosUploadFile).toHaveBeenCalled();
     });
   });
 
@@ -201,13 +266,13 @@ describe('JobManager', () => {
       mocks.verifyDiskSpace.mockResolvedValue(false);
       expect(manager.tryReserveSlot()).toBe(true);
 
-      await expect(
-        manager.createJob(makeCreateParams(), Buffer.from('文本')),
-      ).rejects.toThrow(JobCreationError);
+      await expect(manager.createJob(makeCreateParams(), makeChunks(2))).rejects.toThrow(
+        JobCreationError,
+      );
 
       try {
         expect(manager.tryReserveSlot()).toBe(true); // 名额已释放
-        await manager.createJob(makeCreateParams(), Buffer.from('文本'));
+        await manager.createJob(makeCreateParams(), makeChunks(2));
       } catch (err) {
         expect(err).toBeInstanceOf(JobCreationError);
         expect((err as JobCreationError).statusCode).toBe(507);
@@ -216,23 +281,12 @@ describe('JobManager', () => {
 
     it('磁盘充足时 createJob 成功', async () => {
       mocks.verifyDiskSpace.mockResolvedValue(true);
+      mocks.pipelineExecute.mockImplementation(() => new Promise(() => {}));
       expect(manager.tryReserveSlot()).toBe(true);
 
-      const job = await manager.createJob(makeCreateParams(), Buffer.from('文本'));
+      const job = await manager.createJob(makeCreateParams(), makeChunks(2));
       expect(job.jobId).toBe('test-uuid-1234');
-      expect(job.status).toBe('pending');
-    });
-
-    it('文本为空时 createJob 抛出 400 JobCreationError', async () => {
-      mocks.processText.mockReturnValue([]);
-      expect(manager.tryReserveSlot()).toBe(true);
-
-      try {
-        await manager.createJob(makeCreateParams(), Buffer.from(''));
-      } catch (err) {
-        expect(err).toBeInstanceOf(JobCreationError);
-        expect((err as JobCreationError).statusCode).toBe(400);
-      }
+      expect(job.status).toBe('running');
     });
   });
 
@@ -243,7 +297,7 @@ describe('JobManager', () => {
       // 让 pipeline 一直 pending 不完成
       mocks.pipelineExecute.mockImplementation(() => new Promise(() => {}));
       expect(manager.tryReserveSlot()).toBe(true);
-      await manager.createJob(makeCreateParams(), Buffer.from('文本'));
+      await createAndRun(manager, 2);
 
       const result = manager.cancelJob('test-uuid-1234');
       expect(result).toBe(true);
@@ -257,7 +311,7 @@ describe('JobManager', () => {
     it('resumeJob 将 canceled 任务恢复为 running', async () => {
       mocks.pipelineExecute.mockImplementation(() => new Promise(() => {}));
       expect(manager.tryReserveSlot()).toBe(true);
-      await manager.createJob(makeCreateParams(), Buffer.from('文本'));
+      await createAndRun(manager, 2);
       manager.cancelJob('test-uuid-1234');
 
       const result = manager.resumeJob('test-uuid-1234');

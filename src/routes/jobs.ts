@@ -1,7 +1,8 @@
 /**
  * @file jobs.ts
- * @description 有声书任务的 REST/SSE 路由。前缀 `/api/v1/audiobook`（在 server.ts 注册时指定）。
- * Mock 阶段：所有任务状态由内存 {@link JobManager} 驱动；上传内容仅用于校验，不参与最终输出。
+ * @description 有声书任务的 REST/SSE 路由。前缀在 server.ts 注册时指定（`/api/v1`）。
+ * 创建任务为单次 `POST /jobs`：前端切分后随请求携带全部分片（`chunks` JSON 文件分片）+ 元数据
+ * + 可选封面，后端据此创建任务并后台启动流水线（TTS → 转码 → 合成 M4B）。
  */
 
 import { FastifyInstance, FastifyRequest } from 'fastify';
@@ -10,7 +11,7 @@ import '@fastify/multipart';
 import 'fastify-sse-v2';
 import fs from 'node:fs';
 import path from 'node:path';
-import { JobManager, JobCreationError } from '../services/job-manager.js';
+import { JobManager, JobCreationError, IncomingChunk } from '../services/job-manager.js';
 import { objectStore } from '../services/object-store.js';
 import { JobInfo } from '../types/job.js';
 import { config } from '../config.js';
@@ -28,6 +29,10 @@ const RATE_RE = /^[+-]\d+%$/;
 const PITCH_RE = /^[+-]\d+Hz$/;
 const COVER_MAX_BYTES = 2 * 1024 * 1024;
 const TITLE_MAX = 200;
+/** 单次任务允许的分片总数上限（防滥用） */
+const TOTAL_CHUNKS_MAX = 100_000;
+/** 单个分片正文的字符上限（前端按 ~2500 字切分，留足余量） */
+const CHUNK_TEXT_MAX = 10_000;
 
 /** 客户端可控的错误：携带 HTTP 状态码，由路由直接映射。 */
 class HttpError extends Error {
@@ -46,6 +51,16 @@ function stripControlChars(s: string): string {
   return s.replace(/[\x00-\x1F\x7F]/g, '').trim();
 }
 
+/**
+ * 清洗分片正文：剔除除换行（\n \r）与制表符（\t）外的控制字符，保留正文换行。
+ * 与 {@link stripControlChars} 的区别在于不吞掉换行——正文需要保留段落结构。
+ */
+function sanitizeChunkText(raw: string | undefined): string {
+  if (raw === undefined) return '';
+  // eslint-disable-next-line no-control-regex
+  return raw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').trim();
+}
+
 /** 排干并丢弃一个可读流，返回累计字节数（用于大小校验）。 */
 async function drainAndCount(stream: AsyncIterable<Buffer>): Promise<number> {
   let bytes = 0;
@@ -62,36 +77,27 @@ async function collectBuffer(stream: AsyncIterable<Buffer>): Promise<Buffer> {
 
 interface ParsedUpload {
   fields: Record<string, string>;
-  hasText: boolean;
-  /** 上传的正文文本字节，供真实流水线预处理；非法或缺失时为 null */
-  textBuffer: Buffer | null;
+  chunks: IncomingChunk[];
   coverBuffer: Buffer | null;
   coverExtension: string | null;
 }
 
 /**
- * 解析并校验 multipart 上传。消费所有文件流（Mock 阶段仅校验大小/类型，不持久化内容）。
- * @throws HttpError 当任一字段或文件非法
+ * 解析并校验创建任务的 multipart 请求：元数据 value 字段 + `chunks` JSON 文件分片 + 可选 `cover`。
+ * 分片由前端切分后整体以 `application/json` 文件分片（`TTSChunk[]`）一次性提交——走 `fileSize`
+ * 限制而非字段大小上限，适配整本数 MB 文本。消费所有文件流以避免连接挂起。
+ * @throws HttpError 当封面文件非法、缺少 chunks、chunks 非法 JSON 或分片内容非法
  */
 async function parseAndValidate(request: FastifyRequest): Promise<ParsedUpload> {
   const fields: Record<string, string> = {};
-  let hasText = false;
-  let textBuffer: Buffer | null = null;
   let coverBuffer: Buffer | null = null;
   let coverExtension: string | null = null;
+  let chunksBuffer: Buffer | null = null;
 
   for await (const part of request.parts()) {
     if (part.type === 'file') {
       const ext = path.extname(part.filename || '').toLowerCase();
-      if (part.fieldname === 'text') {
-        if (part.mimetype !== 'text/plain' || ext !== '.txt') {
-          await drainAndCount(part.file); // 必须排干，避免连接挂起
-          throw new HttpError(400, 'Bad Request', 'text 必须 be text/plain 的 .txt 文件');
-        }
-        // 收集正文字节供后续流水线预处理；大小超限由 multipart 抛 413
-        textBuffer = await collectBuffer(part.file);
-        hasText = true;
-      } else if (part.fieldname === 'cover') {
+      if (part.fieldname === 'cover') {
         const okMime = part.mimetype === 'image/jpeg' || part.mimetype === 'image/png';
         const okExt = ['.jpg', '.jpeg', '.png'].includes(ext);
         if (!okMime || !okExt) {
@@ -103,6 +109,8 @@ async function parseAndValidate(request: FastifyRequest): Promise<ParsedUpload> 
           throw new HttpError(400, 'Bad Request', 'cover 大小不能超过 2MB');
         }
         coverExtension = ext;
+      } else if (part.fieldname === 'chunks') {
+        chunksBuffer = await collectBuffer(part.file);
       } else {
         await drainAndCount(part.file); // 未知文件字段：排干丢弃
       }
@@ -111,7 +119,55 @@ async function parseAndValidate(request: FastifyRequest): Promise<ParsedUpload> 
     }
   }
 
-  return { fields, hasText, textBuffer, coverBuffer, coverExtension };
+  const chunks = parseChunks(chunksBuffer);
+  return { fields, chunks, coverBuffer, coverExtension };
+}
+
+/**
+ * 解析并校验 `chunks` JSON 文件分片为 {@link IncomingChunk} 数组。
+ * 要求：可解析为非空数组、片数不超上限；逐片清洗 `text`（非空、不超长）与序号/章节字段。
+ * @throws HttpError（400）当缺失、非法 JSON、或任一分片字段非法
+ */
+function parseChunks(buffer: Buffer | null): IncomingChunk[] {
+  if (!buffer || buffer.length === 0) {
+    throw new HttpError(400, 'Bad Request', 'chunks 为必填项（JSON 文件分片）');
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(buffer.toString('utf-8'));
+  } catch {
+    throw new HttpError(400, 'Bad Request', 'chunks 不是合法 JSON');
+  }
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new HttpError(400, 'Bad Request', 'chunks 必须为非空数组');
+  }
+  if (raw.length > TOTAL_CHUNKS_MAX) {
+    throw new HttpError(400, 'Bad Request', `分片数不能超过 ${TOTAL_CHUNKS_MAX}`);
+  }
+
+  return raw.map((item, i) => {
+    const obj = (item ?? {}) as Record<string, unknown>;
+    const index = Number(obj.index);
+    if (!Number.isInteger(index) || index < 0) {
+      throw new HttpError(400, 'Bad Request', `chunks[${i}].index 必须为非负整数`);
+    }
+    const chapterIndex = Number(obj.chapterIndex);
+    if (!Number.isInteger(chapterIndex) || chapterIndex < 0) {
+      throw new HttpError(400, 'Bad Request', `chunks[${i}].chapterIndex 必须为非负整数`);
+    }
+    const chapterTitle =
+      obj.chapterTitle !== undefined && obj.chapterTitle !== null
+        ? stripControlChars(String(obj.chapterTitle)).slice(0, TITLE_MAX)
+        : undefined;
+    const text = sanitizeChunkText(obj.text === undefined ? undefined : String(obj.text));
+    if (!text) {
+      throw new HttpError(400, 'Bad Request', `chunks[${i}].text 不能为空`);
+    }
+    if (text.length > CHUNK_TEXT_MAX) {
+      throw new HttpError(400, 'Bad Request', `chunks[${i}].text 长度不能超过 ${CHUNK_TEXT_MAX}`);
+    }
+    return { index, chapterIndex, chapterTitle, text };
+  });
 }
 
 /**
@@ -180,7 +236,8 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
   const manager = JobManager.getInstance();
 
   /**
-   * 创建任务：原子占位并发名额 → 解析/校验 multipart → 创建 Mock 任务。
+   * 一步创建并启动任务：原子占位并发名额 → 解析/校验 multipart（元数据 + `chunks` JSON 文件分片
+   * + 可选封面）→ 创建任务（含全部分片）并后台启动流水线。前端负责切分，后端只做文本→音频。
    * 任一失败分支均归还名额。
    */
   fastify.post('/jobs', async (request, reply) => {
@@ -191,22 +248,20 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     }
 
     try {
-      const { fields, hasText, textBuffer, coverBuffer, coverExtension } =
-        await parseAndValidate(request);
-      if (!hasText || !textBuffer) throw new HttpError(400, 'Bad Request', 'text 文件为必填项');
+      const { fields, chunks, coverBuffer, coverExtension } = await parseAndValidate(request);
       const params = buildJobParams(fields);
 
-      // 真实创建：内部做文本预处理、磁盘预检（不足抛 507）、落盘并后台跑流水线。
+      // 创建任务：内部做磁盘预检（不足抛 507）、保存封面、落盘状态并后台启动流水线。
       // createJob 内部 releaseSlot 并转为真实计数。
       const job = await manager.createJob(
         params,
-        textBuffer,
+        chunks,
         coverBuffer || undefined,
         coverExtension || undefined,
       );
       return reply.code(201).send({
         jobId: job.jobId,
-        statusUrl: `/api/v1/audiobook/jobs/${job.jobId}`,
+        statusUrl: `/api/v1/jobs/${job.jobId}`,
         status: job.status,
       });
     } catch (err) {
@@ -214,7 +269,7 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       if (err instanceof HttpError) {
         return reply.code(err.statusCode).send({ error: err.publicName, message: err.message });
       }
-      // 任务创建期错误（如文本为空 400、磁盘不足 507）按其携带的状态码映射
+      // 任务创建期错误（如磁盘不足 507、保存封面失败 500）按其携带的状态码映射
       if (err instanceof JobCreationError) {
         return reply.code(err.statusCode).send({ error: err.publicName, message: err.message });
       }
@@ -305,9 +360,7 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
    * 事件流：handshake → ai-stream* → ai-complete。
    * 复用与 /jobs/:jobId/events 相同的 cleanup + heartbeat 模式。
    */
-  fastify.get('/sse', async (request, reply) => {
-    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
-
+  fastify.get('/sse', async (_request, reply) => {
     const MOCK_TEXT =
       `# 🚀 Hermes Agent 接入测试\n\n` +
       `这是流式传输的 **Markdown** 文本渲染测试。Hermes Agent 运行状态正常。\n\n` +

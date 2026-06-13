@@ -20,7 +20,6 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { config } from '../config.js';
-import { processText } from './text-processor.js';
 import { JobPipeline } from './job-pipeline.js';
 import { saveJobState, loadJobState } from '../utils/state.js';
 import { verifyDiskSpace } from '../utils/disk.js';
@@ -28,7 +27,7 @@ import { verifyDiskSpace } from '../utils/disk.js';
 // 失败时抛错。写出 `${jobDir}/output.m4b`。
 import { assembleAudiobook } from '../utils/ffmpeg.js';
 import { objectStore } from './object-store.js';
-import type { JobInfo, JobState } from '../types/job.js';
+import type { JobInfo, JobState, ChunkState } from '../types/job.js';
 import { logger } from '../utils/logger.js';
 
 /** 终态集合：处于这些状态的任务不再推进。 */
@@ -58,6 +57,18 @@ export interface CreateJobParams {
   rate: string;
   pitch: string;
   bitrate: string;
+}
+
+/** 前端上传的单个分片（已由路由校验/清洗）。对齐前端 `TTSChunk` 的可用字段。 */
+export interface IncomingChunk {
+  /** 全局分片序号（从 0 开始，跨章节累计） */
+  index: number;
+  /** 所属章节序号（从 0 开始） */
+  chapterIndex: number;
+  /** 所属章节标题（可选） */
+  chapterTitle?: string;
+  /** 待合成的纯文本 */
+  text: string;
 }
 
 /**
@@ -305,44 +316,37 @@ export class JobManager extends EventEmitter {
   // ==========================================================================
 
   /**
-   * 创建并启动一个真实任务。
+   * 一步创建任务：前端已切分并随 `POST /jobs` 携带全部分片与元数据，故此处无需"接收中"窗口，
+   * 创建后立即进入 `running`/`tts` 并后台跑 {@link runJob}。
    *
-   * 流程：文本预处理（分块）→ 磁盘空间预检 → 构造并落盘初始 {@link JobState} → 后台跑流水线。
+   * 流程：磁盘空间预检（按分片总数估算峰值）→ 保存封面 → 构造并落盘 {@link JobState}（分片按 `index`
+   * 排序后一次性填入）→ 后台启动流水线。
    *
    * @param params 已校验的任务参数
-   * @param text 上传的文本原始字节
+   * @param chunks 前端切分得到的全部分片（已由路由校验/清洗，至少一片）
    * @returns 新建任务的初始 {@link JobInfo}
-   * @throws {JobCreationError} 文本为空（400）或磁盘空间不足（507）
+   * @throws {JobCreationError} 磁盘空间不足（507）或保存封面失败（500）
    */
   public async createJob(
     params: CreateJobParams,
-    text: Buffer,
+    chunks: IncomingChunk[],
     cover?: Buffer,
     coverExtension?: string,
   ): Promise<JobInfo> {
     const jobId = randomUUID();
     const jobDir = path.join(config.TMP_ROOT, jobId);
-    // todo：移到前端处理分片
-    // 1. 文本预处理：切分为 TTS 分块。
+    const totalChunks = chunks.length;
+
+    // 1. 磁盘空间预检：按分片总数估算峰值，不足直接拒绝，避免运行中途写满磁盘。
     //    注意：以下校验若抛错，并发名额仍为“预留”状态，由路由层 catch 归还，避免重复释放。
-    const ttsChunks = processText(text);
-    if (ttsChunks.length === 0) {
-      throw new JobCreationError(400, 'Bad Request', '文本内容为空或无法切分出有效分片');
-    }
-
-    logger.info(
-      `[job ${jobId}] 创建任务：title=${params.title}，文本=${text.length}B，分片=${ttsChunks.length}`,
-    );
-
-    // 2. 磁盘空间预检：不足直接拒绝，避免运行中途写满磁盘
     fs.mkdirSync(jobDir, { recursive: true });
-    if (!(await verifyDiskSpace(jobDir, ttsChunks.length))) {
+    if (!(await verifyDiskSpace(jobDir, totalChunks))) {
       fs.rmSync(jobDir, { recursive: true, force: true });
-      logger.error(`[job ${jobId}] 磁盘可用空间不足，拒绝创建（分片=${ttsChunks.length}）`);
+      logger.error(`[job ${jobId}] 磁盘可用空间不足，拒绝创建（分片=${totalChunks}）`);
       throw new JobCreationError(507, 'Insufficient Storage', '磁盘可用空间不足以容纳本次任务');
     }
 
-    // 保存封面图片（如果存在）
+    // 2. 保存封面图片（如果存在）
     if (cover && coverExtension) {
       try {
         fs.writeFileSync(path.join(jobDir, `cover${coverExtension}`), cover);
@@ -356,23 +360,11 @@ export class JobManager extends EventEmitter {
     // 校验通过、确定创建：把预留名额转为真实 job 计数
     this.releaseSlot();
 
-    // 3. 构造初始持久化状态
-    const now = new Date().toISOString();
-    const state: JobState = {
-      jobId,
-      title: params.title,
-      author: params.author,
-      status: 'pending',
-      phase: 'preprocess',
-      ttsEngine: params.ttsEngine,
-      voice: params.voice,
-      rate: params.rate,
-      pitch: params.pitch,
-      bitrate: params.bitrate,
-      totalChunks: ttsChunks.length,
-      completedTTS: 0,
-      completedTranscode: 0,
-      chunks: ttsChunks.map((c) => ({
+    // 3. 把分片按 index 排序后映射为持久化状态，构造并落盘初始 JobState，直接进入运行态。
+    const chunkStates: ChunkState[] = chunks
+      .slice()
+      .sort((a, b) => a.index - b.index)
+      .map((c) => ({
         index: c.index,
         chapterIndex: c.chapterIndex,
         chapterTitle: c.chapterTitle,
@@ -380,8 +372,25 @@ export class JobManager extends EventEmitter {
         rawPath: path.join(jobDir, `raw_${c.index}.mp3`),
         m4aPath: path.join(jobDir, `chunk_${c.index}.m4a`),
         durationMs: 0,
-        status: 'pending' as const,
-      })),
+        status: 'pending',
+      }));
+
+    const now = new Date().toISOString();
+    const state: JobState = {
+      jobId,
+      title: params.title,
+      author: params.author,
+      status: 'running',
+      phase: 'tts',
+      ttsEngine: params.ttsEngine,
+      voice: params.voice,
+      rate: params.rate,
+      pitch: params.pitch,
+      bitrate: params.bitrate,
+      totalChunks,
+      completedTTS: 0,
+      completedTranscode: 0,
+      chunks: chunkStates,
       createdAt: now,
       updatedAt: now,
     };
@@ -390,7 +399,7 @@ export class JobManager extends EventEmitter {
     await saveJobState(jobDir, state);
     this.emitSnapshot(state);
 
-    //  后台执行（不阻塞创建响应）
+    logger.info(`[job ${jobId}] 创建任务并启动流水线：title=${params.title}，分片=${totalChunks}`);
     void this.runJob(jobId, jobDir);
     return this.toJobInfo(state);
   }
@@ -423,9 +432,10 @@ export class JobManager extends EventEmitter {
       await assembleAudiobook(state, jobDir);
       if (isCanceled()) return;
 
-      // 阶段二·卸载成品到 COS（启用且尚未上传时）。上传走内网域名，快且不占公网出口。
-      // `!state.remoteKey` 保证重跑/恢复时幂等跳过；失败不致整任务失败——remoteKey 留空，下载回退本地流式。
-      if (objectStore.isEnabled() && !state.remoteKey) {
+      // 阶段二·卸载成品到 COS（开关开启、COS 已配置且尚未上传时）。上传走内网域名，快且不占公网出口。
+      // `COS_UPLOAD_ENABLED` 为总开关（默认 false）；`!state.remoteKey` 保证重跑/恢复时幂等跳过；
+      // 失败不致整任务失败——remoteKey 留空，下载回退本地流式。
+      if (config.COS_UPLOAD_ENABLED && objectStore.isEnabled() && !state.remoteKey) {
         state.phase = 'uploading';
         await saveJobState(jobDir, state);
         this.emitSnapshot(state);
@@ -539,6 +549,9 @@ export class JobManager extends EventEmitter {
       if (!state) continue;
       // 仅恢复未完成任务
       if (state.status !== 'pending' && state.status !== 'running') continue;
+      // 跳过"接收中但未 start"的任务（pending/preprocess）：分片可能尚未到齐，
+      // 此时盲跑流水线会用残缺分片合成，故等用户重新走创建/上传流程。
+      if (state.status === 'pending' && state.phase === 'preprocess') continue;
 
       // 重置为 running，载入内存，重新投入调度——execute 内据 chunk.status 跳过已就绪分片
       state.status = 'running';

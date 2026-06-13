@@ -142,6 +142,8 @@ describe('API Integration Tests', () => {
   beforeEach(async () => {
     app = await buildApp();
     vi.clearAllMocks();
+    // 统一从 edge-tts 起跑：.env 可能把默认引擎设为 mimo-tts，逐用例显式置位避免顺序耦合
+    config.DEFAULT_TTS_ENGINE = 'edge-tts';
   });
 
   afterEach(async () => {
@@ -150,40 +152,55 @@ describe('API Integration Tests', () => {
     config.DEFAULT_TTS_ENGINE = 'edge-tts';
   });
 
-  // ── 4.1 创建任务接口 ─────────────────────────────────────────
+  // ── 4.1 创建任务接口（单次 POST /jobs：元数据 + chunks JSON 文件分片）─────────────
 
-  describe('POST /api/v1/jobs (创建任务)', () => {
+  describe('POST /api/v1/jobs (创建并启动任务)', () => {
     const boundary = '----VitestBoundary123';
 
-    it('成功创建任务并返回 201', async () => {
+    /** 示例分片数组（前端切分结果），作为 `chunks` JSON 文件分片提交。 */
+    const SAMPLE_CHUNKS = [
+      { index: 0, chapterIndex: 0, chapterTitle: '第一章', text: '第一片正文' },
+      { index: 1, chapterIndex: 0, chapterTitle: '第一章', text: '第二片正文' },
+    ];
+
+    /** 构造带 `chunks` JSON 文件分片（+ 可选额外文件）的 multipart body。 */
+    function jobBody(
+      fields: Record<string, string>,
+      chunks: unknown = SAMPLE_CHUNKS,
+      extraFiles: Array<{ name: string; filename: string; mimetype: string; data: string | Buffer }> = [],
+    ): Buffer {
+      const files = [
+        {
+          name: 'chunks',
+          filename: 'chunks.json',
+          mimetype: 'application/json',
+          data: JSON.stringify(chunks),
+        },
+        ...extraFiles,
+      ];
+      return buildMultipartBody(fields, files, boundary);
+    }
+
+    it('成功创建任务并返回 201（chunks 经 createJob 落盘）', async () => {
       mockManager.tryReserveSlot.mockReturnValue(true);
       mockManager.createJob.mockResolvedValue({
         jobId: 'test-uuid-1234',
-        status: 'pending',
+        status: 'running',
         downloadUrl: null,
       });
-
-      // 前端不再传引擎/音色，仅传 title；引擎与音色取自服务端 env 默认值
-      const body = buildMultipartBody(
-        { title: '测试书' },
-        [{ name: 'text', filename: 'text.txt', mimetype: 'text/plain', data: '小说正文内容。' }],
-        boundary,
-      );
 
       const response = await app.inject({
         method: 'POST',
         url: '/api/v1/jobs',
-        headers: {
-          'content-type': `multipart/form-data; boundary=${boundary}`,
-        },
-        payload: body,
+        headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+        payload: jobBody({ title: '测试书' }),
       });
 
       expect(response.statusCode).toBe(201);
       const json = JSON.parse(response.body);
       expect(json.jobId).toBe('test-uuid-1234');
-      expect(json.status).toBe('pending');
-      expect(json.statusUrl).toBe('/api/v1/audiobook/jobs/test-uuid-1234');
+      expect(json.status).toBe('running');
+      expect(json.statusUrl).toBe('/api/v1/jobs/test-uuid-1234');
       expect(mockManager.tryReserveSlot).toHaveBeenCalled();
       expect(mockManager.createJob).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -191,7 +208,7 @@ describe('API Integration Tests', () => {
           ttsEngine: 'edge-tts',
           voice: 'zh-CN-YunxiNeural',
         }),
-        expect.any(Buffer),
+        SAMPLE_CHUNKS,
         undefined,
         undefined,
       );
@@ -200,19 +217,11 @@ describe('API Integration Tests', () => {
     it('并发超限返回 503 Service Unavailable', async () => {
       mockManager.tryReserveSlot.mockReturnValue(false);
 
-      const body = buildMultipartBody(
-        { title: '测试书', voice: 'zh-CN-YunxiNeural' },
-        [{ name: 'text', filename: 'text.txt', mimetype: 'text/plain', data: '正文' }],
-        boundary,
-      );
-
       const response = await app.inject({
         method: 'POST',
         url: '/api/v1/jobs',
-        headers: {
-          'content-type': `multipart/form-data; boundary=${boundary}`,
-        },
-        payload: body,
+        headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+        payload: jobBody({ title: '测试书' }),
       });
 
       expect(response.statusCode).toBe(503);
@@ -223,28 +232,53 @@ describe('API Integration Tests', () => {
       expect(mockManager.releaseSlot).not.toHaveBeenCalled();
     });
 
-    it('缺少 text 字段返回 400 Bad Request 并释放名额', async () => {
+    it('缺少 chunks 文件分片返回 400 Bad Request 并释放名额', async () => {
       mockManager.tryReserveSlot.mockReturnValue(true);
 
-      const body = buildMultipartBody(
-        { title: '测试书', voice: 'zh-CN-YunxiNeural' },
-        [], // 没有文件
-        boundary,
-      );
+      const body = buildMultipartBody({ title: '测试书' }, [], boundary);
 
       const response = await app.inject({
         method: 'POST',
         url: '/api/v1/jobs',
-        headers: {
-          'content-type': `multipart/form-data; boundary=${boundary}`,
-        },
+        headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
         payload: body,
       });
 
       expect(response.statusCode).toBe(400);
       const json = JSON.parse(response.body);
       expect(json.error).toBe('Bad Request');
-      expect(json.message).toContain('text 文件为必填项');
+      expect(json.message).toContain('chunks');
+      expect(mockManager.createJob).not.toHaveBeenCalled();
+      expect(mockManager.releaseSlot).toHaveBeenCalled();
+    });
+
+    it('chunks 为空数组返回 400 并释放名额', async () => {
+      mockManager.tryReserveSlot.mockReturnValue(true);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/v1/jobs',
+        headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+        payload: jobBody({ title: '测试书' }, []),
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(mockManager.createJob).not.toHaveBeenCalled();
+      expect(mockManager.releaseSlot).toHaveBeenCalled();
+    });
+
+    it('分片 text 为空返回 400 并释放名额', async () => {
+      mockManager.tryReserveSlot.mockReturnValue(true);
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/v1/jobs',
+        headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+        payload: jobBody({ title: '测试书' }, [{ index: 0, chapterIndex: 0, text: '' }]),
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(mockManager.createJob).not.toHaveBeenCalled();
       expect(mockManager.releaseSlot).toHaveBeenCalled();
     });
 
@@ -252,30 +286,21 @@ describe('API Integration Tests', () => {
       mockManager.tryReserveSlot.mockReturnValue(true);
       mockManager.createJob.mockResolvedValue({
         jobId: 'test-uuid-ignored',
-        status: 'pending',
+        status: 'running',
         downloadUrl: null,
       });
-
-      // 前端即便传非法引擎/音色也应被忽略，最终采用 env（edge-tts / zh-CN-YunxiNeural）
-      const body = buildMultipartBody(
-        { title: '测试书', ttsEngine: 'mimo-tts', voice: 'zh-CN-IllegalVoice' },
-        [{ name: 'text', filename: 'text.txt', mimetype: 'text/plain', data: '正文' }],
-        boundary,
-      );
 
       const response = await app.inject({
         method: 'POST',
         url: '/api/v1/jobs',
-        headers: {
-          'content-type': `multipart/form-data; boundary=${boundary}`,
-        },
-        payload: body,
+        headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+        payload: jobBody({ title: '测试书', ttsEngine: 'mimo-tts', voice: 'zh-CN-IllegalVoice' }),
       });
 
       expect(response.statusCode).toBe(201);
       expect(mockManager.createJob).toHaveBeenCalledWith(
         expect.objectContaining({ ttsEngine: 'edge-tts', voice: 'zh-CN-YunxiNeural' }),
-        expect.any(Buffer),
+        SAMPLE_CHUNKS,
         undefined,
         undefined,
       );
@@ -286,27 +311,21 @@ describe('API Integration Tests', () => {
       mockManager.tryReserveSlot.mockReturnValue(true);
       mockManager.createJob.mockResolvedValue({
         jobId: 'test-uuid-mimo',
-        status: 'pending',
+        status: 'running',
         downloadUrl: null,
       });
-
-      const body = buildMultipartBody(
-        { title: '测试书' },
-        [{ name: 'text', filename: 'text.txt', mimetype: 'text/plain', data: '小说正文内容。' }],
-        boundary,
-      );
 
       const response = await app.inject({
         method: 'POST',
         url: '/api/v1/jobs',
         headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
-        payload: body,
+        payload: jobBody({ title: '测试书' }),
       });
 
       expect(response.statusCode).toBe(201);
       expect(mockManager.createJob).toHaveBeenCalledWith(
         expect.objectContaining({ ttsEngine: 'mimo-tts', voice: config.MIMO_VOICE }),
-        expect.any(Buffer),
+        SAMPLE_CHUNKS,
         undefined,
         undefined,
       );
@@ -316,17 +335,11 @@ describe('API Integration Tests', () => {
       config.DEFAULT_TTS_ENGINE = 'bogus-engine';
       mockManager.tryReserveSlot.mockReturnValue(true);
 
-      const body = buildMultipartBody(
-        { title: '测试书' },
-        [{ name: 'text', filename: 'text.txt', mimetype: 'text/plain', data: '正文' }],
-        boundary,
-      );
-
       const response = await app.inject({
         method: 'POST',
         url: '/api/v1/jobs',
         headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
-        payload: body,
+        payload: jobBody({ title: '测试书' }),
       });
 
       expect(response.statusCode).toBe(500);
@@ -342,19 +355,11 @@ describe('API Integration Tests', () => {
         new JobCreationError(507, 'Insufficient Storage', '磁盘空间不足'),
       );
 
-      const body = buildMultipartBody(
-        { title: '测试书', voice: 'zh-CN-YunxiNeural' },
-        [{ name: 'text', filename: 'text.txt', mimetype: 'text/plain', data: '小说正文' }],
-        boundary,
-      );
-
       const response = await app.inject({
         method: 'POST',
         url: '/api/v1/jobs',
-        headers: {
-          'content-type': `multipart/form-data; boundary=${boundary}`,
-        },
-        payload: body,
+        headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+        payload: jobBody({ title: '测试书' }),
       });
 
       expect(response.statusCode).toBe(507);

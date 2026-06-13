@@ -20,7 +20,6 @@ import type {
   AudiobookMetadata,
   MuxOptions,
   ValidationResult,
-  ChapterDefinition,
 } from '../types/audio-transcoder.js';
 import { DEFAULT_TRANSCODE_OPTIONS } from '../types/audio-transcoder.js';
 
