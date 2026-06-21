@@ -167,7 +167,12 @@ describe('API Integration Tests', () => {
     function jobBody(
       fields: Record<string, string>,
       chunks: unknown = SAMPLE_CHUNKS,
-      extraFiles: Array<{ name: string; filename: string; mimetype: string; data: string | Buffer }> = [],
+      extraFiles: Array<{
+        name: string;
+        filename: string;
+        mimetype: string;
+        data: string | Buffer;
+      }> = [],
     ): Buffer {
       const files = [
         {
@@ -715,8 +720,22 @@ describe('API Integration Tests', () => {
   describe('GET /api/v1/jobs (任务列表)', () => {
     it('返回任务概览数组', async () => {
       const jobs = [
-        { jobId: 'a', status: 'done', phase: 'ready', title: '书A', uploaded: true, hasLocalFile: false },
-        { jobId: 'b', status: 'running', phase: 'tts', title: '书B', uploaded: false, hasLocalFile: true },
+        {
+          jobId: 'a',
+          status: 'done',
+          phase: 'ready',
+          title: '书A',
+          uploaded: true,
+          hasLocalFile: false,
+        },
+        {
+          jobId: 'b',
+          status: 'running',
+          phase: 'tts',
+          title: '书B',
+          uploaded: false,
+          hasLocalFile: true,
+        },
       ];
       mockManager.listJobs.mockResolvedValue(jobs);
 
@@ -791,20 +810,48 @@ describe('API Integration Tests', () => {
     });
   });
 
-  // ── 额外测试 (AI Stream 接口) ─────────────────────────────────
+  // ── 额外测试 (对话式 Agent 接口) ─────────────────────────────────
 
-  describe('GET /api/v1/sse (AI Stream 接口)', () => {
-    it('正确生成 AI 流式文本，包含 handshake、ai-stream 与 ai-complete', async () => {
-      const response = await app.inject({
-        method: 'GET',
-        url: '/api/v1/sse',
+  describe('POST /api/v1/agent/chat (对话式 Agent)', () => {
+    afterEach(() => {
+      config.AGENT_ENABLED = false;
+    });
+
+    it('AGENT_ENABLED=false 时路由不挂载（404）', async () => {
+      config.AGENT_ENABLED = false;
+      const localApp = await buildApp();
+      const res = await localApp.inject({
+        method: 'POST',
+        url: '/api/v1/agent/chat',
+        payload: { message: '你好' },
       });
+      expect(res.statusCode).toBe(404);
+      await localApp.close();
+    });
 
-      expect(response.statusCode).toBe(200);
-      expect(response.headers['content-type']).toContain('text/event-stream');
-      expect(response.body).toContain('event: handshake');
-      expect(response.body).toContain('event: ai-stream');
-      expect(response.body).toContain('event: ai-complete');
-    }, 15000);
+    it('启用后 message 为空返回 400', async () => {
+      config.AGENT_ENABLED = true;
+      const localApp = await buildApp();
+      const res = await localApp.inject({
+        method: 'POST',
+        url: '/api/v1/agent/chat',
+        payload: { message: '   ' },
+      });
+      expect(res.statusCode).toBe(400);
+      await localApp.close();
+    });
+
+    it('启用但缺 AGENT_LLM_API_KEY 时返回 503', async () => {
+      config.AGENT_ENABLED = true;
+      config.AGENT_LLM_API_KEY = '';
+      const localApp = await buildApp();
+      const res = await localApp.inject({
+        method: 'POST',
+        url: '/api/v1/agent/chat',
+        payload: { message: '现在有哪些任务？' },
+      });
+      expect(res.statusCode).toBe(503);
+      await localApp.close();
+    });
   });
 });

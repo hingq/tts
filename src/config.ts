@@ -74,6 +74,19 @@ export interface Config {
   COS_UPLOAD_ENABLED: boolean;
   /** 是否输出分片级（每个 chunk 的 TTS/转码）调试日志，默认 false，避免大任务刷屏 */
   LOG_VERBOSE: boolean;
+
+  /** 是否启用对话式 Agent（关闭时不注册 /agent/chat 路由），默认 false */
+  AGENT_ENABLED: boolean;
+  /** Agent 使用的 LLM 适配器（'anthropic' | 'openai'），openai 亦覆盖一切 OpenAI 兼容端点，默认 anthropic */
+  AGENT_LLM_PROVIDER: string;
+  /** Agent LLM 模型 ID，如 `claude-opus-4-8` 或 `gpt-4o` */
+  AGENT_LLM_MODEL: string;
+  /** Agent LLM API Key（为空则 Agent 不可用，构造模型时抛错） */
+  AGENT_LLM_API_KEY: string;
+  /** OpenAI 兼容端点的基址（仅 provider=openai 时生效，留空用官方默认） */
+  AGENT_LLM_BASE_URL?: string;
+  /** Agent 单轮工具调用循环的递归上限，防止失控，默认 8 */
+  AGENT_MAX_STEPS: number;
 }
 
 /**
@@ -187,4 +200,12 @@ export const config: Config = {
 
   // 是否输出分片级调试日志（每个 chunk 的 TTS/转码开始与完成），默认关闭，避免数百分片刷屏
   LOG_VERBOSE: true,
+
+  // 对话式 Agent 配置（AGENT_ENABLED 为 false 时不挂载 /agent/chat 路由）
+  AGENT_ENABLED: (process.env.AGENT_ENABLED || 'false') === 'true',
+  AGENT_LLM_PROVIDER: process.env.AGENT_LLM_PROVIDER || 'anthropic',
+  AGENT_LLM_MODEL: process.env.AGENT_LLM_MODEL || 'claude-opus-4-8',
+  AGENT_LLM_API_KEY: process.env.AGENT_LLM_API_KEY || '',
+  AGENT_LLM_BASE_URL: process.env.AGENT_LLM_BASE_URL || undefined,
+  AGENT_MAX_STEPS: parseNumber(process.env.AGENT_MAX_STEPS, 8),
 };

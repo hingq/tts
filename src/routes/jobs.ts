@@ -11,10 +11,12 @@ import '@fastify/multipart';
 import 'fastify-sse-v2';
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { JobManager, JobCreationError, IncomingChunk } from '../services/job-manager.js';
 import { objectStore } from '../services/object-store.js';
 import { JobInfo } from '../types/job.js';
 import { config } from '../config.js';
+import { getAgent, RECURSION_LIMIT } from '../agent/graph.js';
 
 /** 合法 TTS 引擎枚举（用于校验服务端 env 配置，非前端入参）。 */
 const ENGINE_WHITELIST = ['edge-tts', 'mimo-tts'];
@@ -66,6 +68,35 @@ async function drainAndCount(stream: AsyncIterable<Buffer>): Promise<number> {
   let bytes = 0;
   for await (const chunk of stream) bytes += chunk.length;
   return bytes;
+}
+
+/**
+ * 从 LangChain 的 AIMessageChunk 中提取纯文本增量。
+ * content 可能是 string，也可能是 content blocks 数组（如 Anthropic 的 `{type:'text', text}`）。
+ */
+export function extractChunkText(chunk: unknown): string {
+  const content = (chunk as { content?: unknown })?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) =>
+        typeof part === 'string'
+          ? part
+          : typeof (part as { text?: unknown })?.text === 'string'
+            ? (part as { text: string }).text
+            : '',
+      )
+      .join('');
+  }
+  return '';
+}
+
+/**
+ * 将文本中的换行转义为字面量 `\n` 再走 SSE data 字段，沿用与旧 mock 一致的前端协议，
+ * 规避 SSE 协议「空行吞噬」导致前端拼接错位。
+ */
+export function escapeSseText(text: string): string {
+  return text.replace(/\n/g, '\\n');
 }
 
 /** 收集一个可读流的全部字节为 Buffer（文本体积受 multipart fileSize 限制保护）。 */
@@ -209,7 +240,11 @@ function buildJobParams(fields: Record<string, string>): {
   // 音色按引擎从各自的环境变量取（edge → EDGE_VOICE / mimo → MIMO_VOICE）
   const voice = ttsEngine === 'mimo-tts' ? config.MIMO_VOICE : config.EDGE_VOICE;
   if (!VOICE_WHITELIST[ttsEngine].includes(voice)) {
-    throw new HttpError(500, 'Internal Server Error', `服务端 ${ttsEngine} voice 配置非法：${voice}`);
+    throw new HttpError(
+      500,
+      'Internal Server Error',
+      `服务端 ${ttsEngine} voice 配置非法：${voice}`,
+    );
   }
 
   const rate = fields.rate ?? '+0%';
@@ -355,53 +390,86 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     manager.on(`job:${jobId}`, listener);
     request.raw.on('close', cleanup);
   });
-  /**
-   * SSE 流式输出 Mock：模拟大模型逐 token 推送场景。
-   * 事件流：handshake → ai-stream* → ai-complete。
-   * 复用与 /jobs/:jobId/events 相同的 cleanup + heartbeat 模式。
-   */
-  fastify.get('/sse', async (_request, reply) => {
-    const MOCK_TEXT =
-      `# 🚀 Hermes Agent 接入测试\n\n` +
-      `这是流式传输的 **Markdown** 文本渲染测试。Hermes Agent 运行状态正常。\n\n` +
-      `### 1. 核心功能特点\n` +
-      `* **工具调用**：支持自动执行终端命令、运行 Python 脚本。\n` +
-      `* **沙箱隔离**：支持 Local、Docker、SSH 等 6 种环境。\n\n` +
-      `### 2. 代码执行示例\n` +
-      `\`\`\`javascript\n` +
-      `const http = require('http');\n` +
-      `server.listen(3000);\n` +
-      `\`\`\`\n\n` +
-      `--- \n` +
-      `检查完毕，即将发射 ai-complete 信号...`;
+  // 对话式 Agent 路由：仅在 AGENT_ENABLED 时挂载，关闭则完全不存在，不影响 TTS 主链路。
+  if (config.AGENT_ENABLED) {
+    /**
+     * 对话式 Agent（LangGraph.js）。请求体 `{ message, threadId? }`（application/json）。
+     * SSE 事件流：handshake（带 threadId）→ tool-call* / tool-result* / ai-stream* → ai-complete | ai-error。
+     * ai-stream 沿用旧 mock 的逐 token 协议（换行转义为字面量 \n）。
+     * 复用与 /jobs/:jobId/events 相同的 20s 心跳 + 断连 cleanup 模式。
+     */
+    fastify.post('/agent/chat', async (request, reply) => {
+      const body = (request.body ?? {}) as { message?: unknown; threadId?: unknown };
+      const message = typeof body.message === 'string' ? body.message.trim() : '';
+      if (!message) {
+        return reply.code(400).send({ error: 'Bad Request', message: 'message 不能为空' });
+      }
+      // threadId 用于 LangGraph 多轮会话隔离；未提供则新建一轮会话。
+      const threadId =
+        typeof body.threadId === 'string' && body.threadId ? body.threadId : randomUUID();
 
-    async function* createTokenStream() {
-      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-      // 🔥 握手事件：纯 Fastify 风格的第一个发射信号
-      yield {
-        event: 'handshake',
-        data: JSON.stringify({ status: '200', message: 'connected' }),
-      };
-
-      // 🔥 核心修正：使用 for...of 遍历，绝不切碎 UTF-8 编码
-      for (const char of MOCK_TEXT) {
-        // 如果遇到换行符，依然转义为 '\\n' 字符串发给前端，避开 SSE 协议的“空行吞噬”漏洞
-        if (char === '\n') {
-          yield { event: 'ai-stream', data: '\\n' };
-        } else {
-          yield { event: 'ai-stream', data: char };
-        }
-
-        await sleep(25); // 打字机速度
+      let agent: ReturnType<typeof getAgent>;
+      try {
+        agent = getAgent();
+      } catch (err) {
+        // 缺 key / provider 不支持等配置问题：明确 503，避免吞错。
+        return reply.code(503).send({
+          error: 'Service Unavailable',
+          message: `Agent 未正确配置：${(err as Error).message}`,
+        });
       }
 
-      yield { event: 'ai-complete', data: 'done' };
-    }
+      reply.sse({ event: 'handshake', data: JSON.stringify({ threadId }) });
 
-    // Fastify 会自动接管心跳（Keep-Alive）、编码（UTF-8）以及客户端连接断开时的资源释放（Cleanup）
-    return reply.sse(createTokenStream());
-  });
+      let cleaned = false;
+      const heartbeat = setInterval(() => reply.sse({ comment: 'keepalive' }), 20_000);
+      const cleanup = (): void => {
+        if (cleaned) return;
+        cleaned = true;
+        clearInterval(heartbeat);
+        reply.sseContext.source.end();
+      };
+      request.raw.on('close', cleanup);
+
+      try {
+        const stream = agent.streamEvents(
+          { messages: [{ role: 'user', content: message }] },
+          { version: 'v2', configurable: { thread_id: threadId }, recursionLimit: RECURSION_LIMIT },
+        );
+        for await (const ev of stream) {
+          if (cleaned) break;
+          if (ev.event === 'on_chat_model_stream') {
+            const text = extractChunkText(ev.data?.chunk);
+            if (text) reply.sse({ event: 'ai-stream', data: escapeSseText(text) });
+          } else if (ev.event === 'on_tool_start') {
+            reply.sse({
+              event: 'tool-call',
+              data: JSON.stringify({ name: ev.name, input: ev.data?.input }),
+            });
+          } else if (ev.event === 'on_tool_end') {
+            const output = ev.data?.output;
+            reply.sse({
+              event: 'tool-result',
+              data: JSON.stringify({
+                name: ev.name,
+                output: typeof output === 'string' ? output : (output?.content ?? output),
+              }),
+            });
+          }
+        }
+        if (!cleaned) reply.sse({ event: 'ai-complete', data: 'done' });
+      } catch (err) {
+        if (!cleaned) {
+          reply.sse({
+            event: 'ai-error',
+            data: JSON.stringify({ message: (err as Error).message }),
+          });
+        }
+      } finally {
+        cleanup();
+      }
+    });
+  }
   /** 带 Range 的文件下载；下载完成后异步清理工作目录。 */
   fastify.get('/jobs/:jobId/file', async (request, reply) => {
     const { jobId } = request.params as { jobId: string };
