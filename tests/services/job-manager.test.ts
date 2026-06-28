@@ -55,9 +55,11 @@ vi.mock('../../src/utils/state.js', () => ({
 }));
 
 vi.mock('../../src/services/job-pipeline.js', () => ({
-  JobPipeline: vi.fn().mockImplementation(class {
-    execute = mocks.pipelineExecute;
-  }),
+  JobPipeline: vi.fn().mockImplementation(
+    class {
+      execute = mocks.pipelineExecute;
+    },
+  ),
 }));
 
 vi.mock('../../src/utils/ffmpeg.js', () => ({
@@ -238,8 +240,8 @@ describe('JobManager', () => {
   describe('全局并发锁', () => {
     it('达到 MAX_CONCURRENT_JOBS 后 tryReserveSlot 返回 false', () => {
       // MAX_CONCURRENT_JOBS = 2
-      expect(manager.tryReserveSlot()).toBe(true);  // reserved=1
-      expect(manager.tryReserveSlot()).toBe(true);  // reserved=2
+      expect(manager.tryReserveSlot()).toBe(true); // reserved=1
+      expect(manager.tryReserveSlot()).toBe(true); // reserved=2
       expect(manager.tryReserveSlot()).toBe(false); // 已满
     });
 

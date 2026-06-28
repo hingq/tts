@@ -17,9 +17,11 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../../src/providers/edge-tts.js', () => ({
-  EdgeTTSProvider: vi.fn().mockImplementation(class {
-    synthesize = mocks.synthesize;
-  }),
+  EdgeTTSProvider: vi.fn().mockImplementation(
+    class {
+      synthesize = mocks.synthesize;
+    },
+  ),
 }));
 
 // 模块 05 尚未落地——这里用工厂提供桩，使流水线可在隔离环境下测试
@@ -68,7 +70,13 @@ function makeState(chunks: ChunkState[]): JobState {
 /** 用 fake timers 驱动包含随机延时的流水线至完成。 */
 async function runToCompletion(promise: Promise<void>): Promise<void> {
   let resolved = false;
-  promise.then(() => { resolved = true; }).catch(() => { resolved = true; });
+  promise
+    .then(() => {
+      resolved = true;
+    })
+    .catch(() => {
+      resolved = true;
+    });
   while (!resolved) {
     await vi.runAllTimersAsync();
     await new Promise((resolve) => process.nextTick(resolve));

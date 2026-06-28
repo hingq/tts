@@ -86,7 +86,9 @@ describe('uploadFile', () => {
   it('以正确参数调用 SDK uploadFile 并在回调成功时 resolve', async () => {
     mocks.uploadFile.mockImplementation((_params: unknown, cb: (e: unknown) => void) => cb(null));
     const store = new CosObjectStore();
-    await expect(store.uploadFile('/tmp/x/output.m4b', 'audiobooks/x.m4b')).resolves.toBeUndefined();
+    await expect(
+      store.uploadFile('/tmp/x/output.m4b', 'audiobooks/x.m4b'),
+    ).resolves.toBeUndefined();
 
     const params = mocks.uploadFile.mock.calls[0][0];
     expect(params).toMatchObject({
@@ -102,7 +104,9 @@ describe('uploadFile', () => {
     const boom = new Error('网络中断');
     mocks.uploadFile.mockImplementation((_params: unknown, cb: (e: unknown) => void) => cb(boom));
     const store = new CosObjectStore();
-    await expect(store.uploadFile('/tmp/x/output.m4b', 'audiobooks/x.m4b')).rejects.toThrow('网络中断');
+    await expect(store.uploadFile('/tmp/x/output.m4b', 'audiobooks/x.m4b')).rejects.toThrow(
+      '网络中断',
+    );
   });
 
   it('未启用时调用直接抛错', async () => {
@@ -137,7 +141,8 @@ describe('getPresignedUrl', () => {
 
   it('回调返回错误时 reject', async () => {
     mocks.getObjectUrl.mockImplementation(
-      (_params: unknown, cb: (e: unknown, d?: { Url: string }) => void) => cb(new Error('签名失败')),
+      (_params: unknown, cb: (e: unknown, d?: { Url: string }) => void) =>
+        cb(new Error('签名失败')),
     );
     const store = new CosObjectStore();
     await expect(store.getPresignedUrl('k', 'a.m4b')).rejects.toThrow('签名失败');

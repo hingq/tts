@@ -190,11 +190,9 @@ describe('writeChaptersMetadata', () => {
 
   it('generates correct FFMETADATA1 with chapters', async () => {
     let writtenContent = '';
-    vi.spyOn(fs.promises, 'writeFile').mockImplementation(
-      async (_path, data) => {
-        writtenContent = data as string;
-      },
-    );
+    vi.spyOn(fs.promises, 'writeFile').mockImplementation(async (_path, data) => {
+      writtenContent = data as string;
+    });
 
     await writeChaptersMetadata(
       {
@@ -235,16 +233,11 @@ describe('writeFileList', () => {
 
   it('generates correct filelist.txt with escaped paths', async () => {
     let writtenContent = '';
-    vi.spyOn(fs.promises, 'writeFile').mockImplementation(
-      async (_path, data) => {
-        writtenContent = data as string;
-      },
-    );
+    vi.spyOn(fs.promises, 'writeFile').mockImplementation(async (_path, data) => {
+      writtenContent = data as string;
+    });
 
-    await writeFileList(
-      ['/audio/ch1.m4a', "/audio/it's ch2.m4a"],
-      '/tmp/filelist.txt',
-    );
+    await writeFileList(['/audio/ch1.m4a', "/audio/it's ch2.m4a"], '/tmp/filelist.txt');
 
     const lines = writtenContent.split('\n');
     expect(lines).toHaveLength(2);
@@ -268,15 +261,19 @@ describe('validateFaststart', () => {
 
     const mockFd = {
       stat: vi.fn().mockResolvedValue({ size: 256 }),
-      read: vi.fn().mockImplementation(
-        async (buffer: Buffer, _offset: number, length: number, _pos: number) => {
-          buf.copy(buffer, 0, 0, length);
-          return { bytesRead: length, buffer };
-        },
-      ),
+      read: vi
+        .fn()
+        .mockImplementation(
+          async (buffer: Buffer, _offset: number, length: number, _pos: number) => {
+            buf.copy(buffer, 0, 0, length);
+            return { bytesRead: length, buffer };
+          },
+        ),
       close: vi.fn().mockResolvedValue(undefined),
     };
-    vi.spyOn(fs.promises, 'open').mockResolvedValueOnce(mockFd as unknown as fs.promises.FileHandle);
+    vi.spyOn(fs.promises, 'open').mockResolvedValueOnce(
+      mockFd as unknown as fs.promises.FileHandle,
+    );
 
     expect(await validateFaststart('/test.m4b')).toBe(true);
   });
@@ -288,15 +285,19 @@ describe('validateFaststart', () => {
 
     const mockFd = {
       stat: vi.fn().mockResolvedValue({ size: 256 }),
-      read: vi.fn().mockImplementation(
-        async (buffer: Buffer, _offset: number, length: number, _pos: number) => {
-          buf.copy(buffer, 0, 0, length);
-          return { bytesRead: length, buffer };
-        },
-      ),
+      read: vi
+        .fn()
+        .mockImplementation(
+          async (buffer: Buffer, _offset: number, length: number, _pos: number) => {
+            buf.copy(buffer, 0, 0, length);
+            return { bytesRead: length, buffer };
+          },
+        ),
       close: vi.fn().mockResolvedValue(undefined),
     };
-    vi.spyOn(fs.promises, 'open').mockResolvedValueOnce(mockFd as unknown as fs.promises.FileHandle);
+    vi.spyOn(fs.promises, 'open').mockResolvedValueOnce(
+      mockFd as unknown as fs.promises.FileHandle,
+    );
 
     expect(await validateFaststart('/test.m4b')).toBe(false);
   });
@@ -307,15 +308,19 @@ describe('validateFaststart', () => {
 
     const mockFd = {
       stat: vi.fn().mockResolvedValue({ size: 256 }),
-      read: vi.fn().mockImplementation(
-        async (buffer: Buffer, _offset: number, length: number, _pos: number) => {
-          buf.copy(buffer, 0, 0, length);
-          return { bytesRead: length, buffer };
-        },
-      ),
+      read: vi
+        .fn()
+        .mockImplementation(
+          async (buffer: Buffer, _offset: number, length: number, _pos: number) => {
+            buf.copy(buffer, 0, 0, length);
+            return { bytesRead: length, buffer };
+          },
+        ),
       close: vi.fn().mockResolvedValue(undefined),
     };
-    vi.spyOn(fs.promises, 'open').mockResolvedValueOnce(mockFd as unknown as fs.promises.FileHandle);
+    vi.spyOn(fs.promises, 'open').mockResolvedValueOnce(
+      mockFd as unknown as fs.promises.FileHandle,
+    );
 
     expect(await validateFaststart('/test.m4b')).toBe(false);
   });
@@ -326,15 +331,19 @@ describe('validateFaststart', () => {
 
     const mockFd = {
       stat: vi.fn().mockResolvedValue({ size: 256 }),
-      read: vi.fn().mockImplementation(
-        async (buffer: Buffer, _offset: number, length: number, _pos: number) => {
-          buf.copy(buffer, 0, 0, length);
-          return { bytesRead: length, buffer };
-        },
-      ),
+      read: vi
+        .fn()
+        .mockImplementation(
+          async (buffer: Buffer, _offset: number, length: number, _pos: number) => {
+            buf.copy(buffer, 0, 0, length);
+            return { bytesRead: length, buffer };
+          },
+        ),
       close: vi.fn().mockResolvedValue(undefined),
     };
-    vi.spyOn(fs.promises, 'open').mockResolvedValueOnce(mockFd as unknown as fs.promises.FileHandle);
+    vi.spyOn(fs.promises, 'open').mockResolvedValueOnce(
+      mockFd as unknown as fs.promises.FileHandle,
+    );
 
     expect(await validateFaststart('/test.m4b')).toBe(true);
   });
@@ -363,13 +372,20 @@ describe('transcodeSegment', () => {
       'ffmpeg',
       expect.arrayContaining([
         '-y',
-        '-i', '/input.mp3',
-        '-c:a', 'aac',
-        '-profile:a', 'aac_low',
-        '-b:a', '64k',
-        '-ar', '24000',
-        '-ac', '1',
-        '-movflags', '+faststart',
+        '-i',
+        '/input.mp3',
+        '-c:a',
+        'aac',
+        '-profile:a',
+        'aac_low',
+        '-b:a',
+        '64k',
+        '-ar',
+        '24000',
+        '-ac',
+        '1',
+        '-movflags',
+        '+faststart',
         '/output.m4a',
       ]),
       expect.objectContaining({ shell: false }),
