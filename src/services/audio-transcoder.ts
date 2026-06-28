@@ -60,11 +60,7 @@ export function runCommandAsync(
       // eslint-disable-next-line no-console
       console.warn(`[subprocess] 超时 ${timeoutMs}ms，SIGKILL 终止：${command} ${args.join(' ')}`);
       child.kill('SIGKILL');
-      reject(
-        new Error(
-          `Command timed out after ${timeoutMs}ms: ${command} ${args.join(' ')}`,
-        ),
-      );
+      reject(new Error(`Command timed out after ${timeoutMs}ms: ${command} ${args.join(' ')}`));
     }, timeoutMs);
 
     child.on('error', (err) => {
@@ -127,13 +123,20 @@ export async function transcodeSegment(
 ): Promise<CommandResult> {
   const args = [
     '-y',
-    '-i', inputPath,
-    '-c:a', options.codec,
-    '-profile:a', options.profile,
-    '-b:a', options.bitrate,
-    '-ar', String(options.sampleRate),
-    '-ac', String(options.channels),
-    '-movflags', '+faststart',
+    '-i',
+    inputPath,
+    '-c:a',
+    options.codec,
+    '-profile:a',
+    options.profile,
+    '-b:a',
+    options.bitrate,
+    '-ar',
+    String(options.sampleRate),
+    '-ac',
+    String(options.channels),
+    '-movflags',
+    '+faststart',
     outputPath,
   ];
   return runCommandAsync(config.FFMPEG_PATH, args);
@@ -149,15 +152,20 @@ export async function transcodeSegment(
  */
 export async function extractDurationMs(filePath: string): Promise<number> {
   const args = [
-    '-v', 'error',
-    '-show_entries', 'format=duration',
-    '-of', 'default=noprint_wrappers=1:nokey=1',
+    '-v',
+    'error',
+    '-show_entries',
+    'format=duration',
+    '-of',
+    'default=noprint_wrappers=1:nokey=1',
     filePath,
   ];
   const result = await runCommandAsync(config.FFPROBE_PATH, args, 15_000);
   const durationSec = parseFloat(result.stdout.trim());
   if (isNaN(durationSec)) {
-    throw new Error(`Failed to parse duration from ffprobe output: "${result.stdout.trim()}" for file ${filePath}`);
+    throw new Error(
+      `Failed to parse duration from ffprobe output: "${result.stdout.trim()}" for file ${filePath}`,
+    );
   }
   return Math.round(durationSec * 1000);
 }
@@ -234,13 +242,8 @@ export function escapeFilelistPath(filePath: string): string {
  * @param chunkPaths 有序的音频段文件路径列表
  * @param outputPath 输出 filelist.txt 路径
  */
-export async function writeFileList(
-  chunkPaths: string[],
-  outputPath: string,
-): Promise<void> {
-  const lines = chunkPaths.map(
-    (p) => `file '${escapeFilelistPath(p)}'`,
-  );
+export async function writeFileList(chunkPaths: string[], outputPath: string): Promise<void> {
+  const lines = chunkPaths.map((p) => `file '${escapeFilelistPath(p)}'`);
   await fs.promises.writeFile(outputPath, lines.join('\n'), 'utf-8');
 }
 
@@ -259,10 +262,14 @@ export async function muxAudiobook(options: MuxOptions): Promise<CommandResult> 
 
   const args: string[] = [
     '-y',
-    '-f', 'concat',
-    '-safe', '0',
-    '-i', filelistPath,
-    '-i', options.metadataPath,
+    '-f',
+    'concat',
+    '-safe',
+    '0',
+    '-i',
+    filelistPath,
+    '-i',
+    options.metadataPath,
   ];
 
   if (options.coverImagePath) {
@@ -312,26 +319,25 @@ export async function validateM4bFile(
   // 1) 验证容器格式
   try {
     const formatArgs = [
-      '-v', 'error',
-      '-show_entries', 'format=format_name',
-      '-of', 'default=noprint_wrappers=1:nokey=1',
+      '-v',
+      'error',
+      '-show_entries',
+      'format=format_name',
+      '-of',
+      'default=noprint_wrappers=1:nokey=1',
       filePath,
     ];
     const formatResult = await runCommandAsync(config.FFPROBE_PATH, formatArgs, 15_000);
     const formatName = formatResult.stdout.trim();
-    result.formatValid = formatName.includes('mp4') || formatName.includes('m4a') || formatName.includes('mov');
+    result.formatValid =
+      formatName.includes('mp4') || formatName.includes('m4a') || formatName.includes('mov');
   } catch {
     result.formatValid = false;
   }
 
   // 2) 验证章节数量
   try {
-    const chapterArgs = [
-      '-v', 'error',
-      '-show_chapters',
-      '-of', 'json',
-      filePath,
-    ];
+    const chapterArgs = ['-v', 'error', '-show_chapters', '-of', 'json', filePath];
     const chapterResult = await runCommandAsync(config.FFPROBE_PATH, chapterArgs, 15_000);
     const parsed = JSON.parse(chapterResult.stdout);
     result.actualChapterCount = Array.isArray(parsed.chapters) ? parsed.chapters.length : 0;

@@ -391,85 +391,77 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     request.raw.on('close', cleanup);
   });
   // 对话式 Agent 路由：仅在 AGENT_ENABLED 时挂载，关闭则完全不存在，不影响 TTS 主链路。
-  if (config.AGENT_ENABLED) {
-    /**
-     * 对话式 Agent（LangGraph.js）。请求体 `{ message, threadId? }`（application/json）。
-     * SSE 事件流：handshake（带 threadId）→ tool-call* / tool-result* / ai-stream* → ai-complete | ai-error。
-     * ai-stream 沿用旧 mock 的逐 token 协议（换行转义为字面量 \n）。
-     * 复用与 /jobs/:jobId/events 相同的 20s 心跳 + 断连 cleanup 模式。
-     */
-    fastify.post('/agent/chat', async (request, reply) => {
-      const body = (request.body ?? {}) as { message?: unknown; threadId?: unknown };
-      const message = typeof body.message === 'string' ? body.message.trim() : '';
-      if (!message) {
-        return reply.code(400).send({ error: 'Bad Request', message: 'message 不能为空' });
-      }
-      // threadId 用于 LangGraph 多轮会话隔离；未提供则新建一轮会话。
-      const threadId =
-        typeof body.threadId === 'string' && body.threadId ? body.threadId : randomUUID();
+  fastify.post('/agent/chat', async (request, reply) => {
+    const body = (request.body ?? {}) as { message?: unknown; threadId?: unknown };
+    const message = typeof body.message === 'string' ? body.message.trim() : '';
+    if (!message) {
+      return reply.code(400).send({ error: 'Bad Request', message: 'message 不能为空' });
+    }
+    // threadId 用于 LangGraph 多轮会话隔离；未提供则新建一轮会话。
+    const threadId =
+      typeof body.threadId === 'string' && body.threadId ? body.threadId : randomUUID();
 
-      let agent: ReturnType<typeof getAgent>;
-      try {
-        agent = getAgent();
-      } catch (err) {
-        // 缺 key / provider 不支持等配置问题：明确 503，避免吞错。
-        return reply.code(503).send({
-          error: 'Service Unavailable',
-          message: `Agent 未正确配置：${(err as Error).message}`,
-        });
-      }
+    let agent: ReturnType<typeof getAgent>;
+    try {
+      agent = getAgent();
+    } catch (err) {
+      // 缺 key / provider 不支持等配置问题：明确 503，避免吞错。
+      return reply.code(503).send({
+        error: 'Service Unavailable',
+        message: `Agent 未正确配置：${(err as Error).message}`,
+      });
+    }
 
-      reply.sse({ event: 'handshake', data: JSON.stringify({ threadId }) });
+    reply.sse({ event: 'handshake', data: JSON.stringify({ threadId }) });
 
-      let cleaned = false;
-      const heartbeat = setInterval(() => reply.sse({ comment: 'keepalive' }), 20_000);
-      const cleanup = (): void => {
-        if (cleaned) return;
-        cleaned = true;
-        clearInterval(heartbeat);
-        reply.sseContext.source.end();
-      };
-      request.raw.on('close', cleanup);
+    let cleaned = false;
+    const heartbeat = setInterval(() => reply.sse({ comment: 'keepalive' }), 20_000);
+    const cleanup = (): void => {
+      if (cleaned) return;
+      cleaned = true;
+      clearInterval(heartbeat);
+      reply.sseContext.source.end();
+    };
+    request.raw.on('close', cleanup);
 
-      try {
-        const stream = agent.streamEvents(
-          { messages: [{ role: 'user', content: message }] },
-          { version: 'v2', configurable: { thread_id: threadId }, recursionLimit: RECURSION_LIMIT },
-        );
-        for await (const ev of stream) {
-          if (cleaned) break;
-          if (ev.event === 'on_chat_model_stream') {
-            const text = extractChunkText(ev.data?.chunk);
-            if (text) reply.sse({ event: 'ai-stream', data: escapeSseText(text) });
-          } else if (ev.event === 'on_tool_start') {
-            reply.sse({
-              event: 'tool-call',
-              data: JSON.stringify({ name: ev.name, input: ev.data?.input }),
-            });
-          } else if (ev.event === 'on_tool_end') {
-            const output = ev.data?.output;
-            reply.sse({
-              event: 'tool-result',
-              data: JSON.stringify({
-                name: ev.name,
-                output: typeof output === 'string' ? output : (output?.content ?? output),
-              }),
-            });
-          }
-        }
-        if (!cleaned) reply.sse({ event: 'ai-complete', data: 'done' });
-      } catch (err) {
-        if (!cleaned) {
+    try {
+      const stream = agent.streamEvents(
+        { messages: [{ role: 'user', content: message }] },
+        { version: 'v2', configurable: { thread_id: threadId }, recursionLimit: RECURSION_LIMIT },
+      );
+      for await (const ev of stream) {
+        if (cleaned) break;
+        if (ev.event === 'on_chat_model_stream') {
+          const text = extractChunkText(ev.data?.chunk);
+          if (text) reply.sse({ event: 'ai-stream', data: escapeSseText(text) });
+        } else if (ev.event === 'on_tool_start') {
           reply.sse({
-            event: 'ai-error',
-            data: JSON.stringify({ message: (err as Error).message }),
+            event: 'tool-call',
+            data: JSON.stringify({ name: ev.name, input: ev.data?.input }),
+          });
+        } else if (ev.event === 'on_tool_end') {
+          const output = ev.data?.output;
+          reply.sse({
+            event: 'tool-result',
+            data: JSON.stringify({
+              name: ev.name,
+              output: typeof output === 'string' ? output : (output?.content ?? output),
+            }),
           });
         }
-      } finally {
-        cleanup();
       }
-    });
-  }
+      if (!cleaned) reply.sse({ event: 'ai-complete', data: 'done' });
+    } catch (err) {
+      if (!cleaned) {
+        reply.sse({
+          event: 'ai-error',
+          data: JSON.stringify({ message: (err as Error).message }),
+        });
+      }
+    } finally {
+      cleanup();
+    }
+  });
   /** 带 Range 的文件下载；下载完成后异步清理工作目录。 */
   fastify.get('/jobs/:jobId/file', async (request, reply) => {
     const { jobId } = request.params as { jobId: string };

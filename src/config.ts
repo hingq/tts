@@ -87,6 +87,20 @@ export interface Config {
   AGENT_LLM_BASE_URL?: string;
   /** Agent 单轮工具调用循环的递归上限，防止失控，默认 8 */
   AGENT_MAX_STEPS: number;
+
+  /**
+   * 是否启用 LangGraph 编排图驱动有声书生成（默认 false）。
+   * 关闭时 `runJob` 走既有命令式流水线，行为完全不变；
+   * 开启时把生成路由到 `src/orchestrator/` 的阶段图。
+   */
+  ORCHESTRATOR_ENABLED: boolean;
+
+  /** DeepSeek 文本决策模型 ID（脚本情感/语速导演用），默认 `deepseek-chat` */
+  DEEPSEEK_MODEL: string;
+  /** DeepSeek API Key（留空视为未启用，编排图各决策节点走确定性兜底） */
+  DEEPSEEK_API_KEY: string;
+  /** DeepSeek OpenAI 兼容端点基址，默认 `https://api.deepseek.com/v1`（命名与 `MIMO_*` 一致） */
+  DEEPSEEK_BASE_URL: string;
 }
 
 /**
@@ -201,11 +215,16 @@ export const config: Config = {
   // 是否输出分片级调试日志（每个 chunk 的 TTS/转码开始与完成），默认关闭，避免数百分片刷屏
   LOG_VERBOSE: true,
 
-  // 对话式 Agent 配置（AGENT_ENABLED 为 false 时不挂载 /agent/chat 路由）
-  AGENT_ENABLED: (process.env.AGENT_ENABLED || 'false') === 'true',
-  AGENT_LLM_PROVIDER: process.env.AGENT_LLM_PROVIDER || 'anthropic',
-  AGENT_LLM_MODEL: process.env.AGENT_LLM_MODEL || 'claude-opus-4-8',
-  AGENT_LLM_API_KEY: process.env.AGENT_LLM_API_KEY || '',
-  AGENT_LLM_BASE_URL: process.env.AGENT_LLM_BASE_URL || undefined,
+  AGENT_LLM_MODEL: process.env.DEEPSEEK_MODEL || '',
+  AGENT_LLM_API_KEY: process.env.DEEPSEEK_API_KEY || '',
+  AGENT_LLM_BASE_URL: process.env.DEEPSEEK_BASE_URL || undefined,
   AGENT_MAX_STEPS: parseNumber(process.env.AGENT_MAX_STEPS, 8),
+
+  // LangGraph 编排图开关（默认关闭；开启后 runJob 路由到 src/orchestrator/ 的阶段图）
+  ORCHESTRATOR_ENABLED: (process.env.ORCHESTRATOR_ENABLED || 'false') === 'true',
+
+  // DeepSeek 文本决策模型配置（脚本情感/语速导演用；DEEPSEEK_API_KEY 留空则各决策节点走确定性兜底）
+  DEEPSEEK_MODEL: process.env.DEEPSEEK_MODEL || 'deepseek-v4-flash',
+  DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY || '',
+  DEEPSEEK_BASE_URL: process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1',
 };

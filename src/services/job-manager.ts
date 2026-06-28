@@ -29,6 +29,10 @@ import { assembleAudiobook } from '../utils/ffmpeg.js';
 import { objectStore } from './object-store.js';
 import type { JobInfo, JobState, ChunkState } from '../types/job.js';
 import { logger } from '../utils/logger.js';
+import { Orchestrator } from '../orchestrator/orchestrator.js';
+import { createCheckpointStore } from '../orchestrator/checkpoint.js';
+import { createDecisionClient } from '../orchestrator/llm.js';
+import type { OrchestratorContext } from '../orchestrator/orchestrator.js';
 
 /** 终态集合：处于这些状态的任务不再推进。 */
 const TERMINAL_STATES: ReadonlyArray<string> = ['done', 'failed', 'canceled'];
@@ -192,7 +196,6 @@ export class JobManager extends EventEmitter {
     await objectStore.uploadFile(path.join(jobDir, 'output.m4b'), key);
     state.remoteKey = key;
     await saveJobState(jobDir, state);
-    // eslint-disable-next-line no-console
     logger.info(`[job ${state.jobId}] COS 上传成功：key=${key}，删除本地=${deleteLocal}`);
     if (deleteLocal) {
       // 删除失败忽略（如已不存在）：仍可由 GC 兜底
@@ -405,8 +408,9 @@ export class JobManager extends EventEmitter {
   }
 
   /**
-   * 后台编排一个任务的完整生命周期：tts（合成+转码）→ mux → validating → ready。
-   * 任一阶段抛错则置 `failed`；运行中被取消则提前退出且不覆盖终态。
+   * 后台编排任务：按 `ORCHESTRATOR_ENABLED` 分流到编排图或既有命令式流水线。
+   * 两条路径共享 {@link finalizeJob} 的 uploading/validating/ready 收尾；
+   * 任一阶段抛错由本方法的 try/catch 统一置 `failed`（取消导致的抛错除外）。
    *
    * @param jobId 任务标识
    * @param jobDir 工作目录绝对路径
@@ -414,51 +418,16 @@ export class JobManager extends EventEmitter {
   private async runJob(jobId: string, jobDir: string): Promise<void> {
     const state = this.jobs.get(jobId);
     if (!state) return;
-    // 取消查询钩子：以内存中的最新状态为准，使流水线内尚未开始的分片能及时跳过
+    // 取消查询钩子：以内存中的最新状态为准，使流水线/图内尚未开始的工作能及时跳过
     const isCanceled = (): boolean => this.jobs.get(jobId)?.status === 'canceled';
-
-    logger.info(`[job ${jobId}] 开始执行流水线，共 ${state.totalChunks} 分片`);
-
+    const mode = config.ORCHESTRATOR_ENABLED ? '编排图' : '命令式';
+    logger.info(`[job ${jobId}] 开始执行（${mode}流水线），共 ${state.totalChunks} 分片`);
     try {
-      // 阶段一：TTS 合成 + 逐分片转码（双并发池流水线）
-      await this.pipeline.execute(state, jobDir, () => this.emitSnapshot(state), isCanceled);
-      if (isCanceled()) return;
-
-      // 阶段二：合成 M4B（委托模块 05：拼接 M4A + 章节元数据 + 封面，并做完整性校验）
-      state.phase = 'mux';
-      await saveJobState(jobDir, state);
-      this.emitSnapshot(state);
-      logger.info(`[job ${jobId}] 阶段 -> mux：合成 M4B`);
-      await assembleAudiobook(state, jobDir);
-      if (isCanceled()) return;
-
-      // 阶段二·卸载成品到 COS（开关开启、COS 已配置且尚未上传时）。上传走内网域名，快且不占公网出口。
-      // `COS_UPLOAD_ENABLED` 为总开关（默认 false）；`!state.remoteKey` 保证重跑/恢复时幂等跳过；
-      // 失败不致整任务失败——remoteKey 留空，下载回退本地流式。
-      if (config.COS_UPLOAD_ENABLED && objectStore.isEnabled() && !state.remoteKey) {
-        state.phase = 'uploading';
-        await saveJobState(jobDir, state);
-        this.emitSnapshot(state);
-        logger.info(`[job ${jobId}] 阶段 -> uploading：卸载成品到 COS`);
-        try {
-          await this.doUpload(state, jobDir, true);
-        } catch (uploadErr) {
-          logger.info(`[job ${jobId}] COS 上传失败，回退本地下载：`, uploadErr);
-        }
-        if (isCanceled()) return;
+      if (config.ORCHESTRATOR_ENABLED) {
+        await this.runOrchestrated(state, jobDir, isCanceled);
+      } else {
+        await this.runImperative(state, jobDir, isCanceled);
       }
-
-      // 阶段三：校验已在 assembleAudiobook 内完成，此处推进至就绪
-      state.phase = 'validating';
-      await saveJobState(jobDir, state);
-      this.emitSnapshot(state);
-
-      // 阶段四：就绪，标记完成
-      state.phase = 'ready';
-      state.status = 'done';
-      await saveJobState(jobDir, state);
-      this.emitSnapshot(state);
-      logger.info(`[job ${jobId}] 任务完成（done）`);
     } catch (err) {
       // 被取消导致的抛错不视为失败
       if (isCanceled()) return;
@@ -469,6 +438,106 @@ export class JobManager extends EventEmitter {
       await saveJobState(jobDir, state).catch(() => undefined);
       this.emitSnapshot(state);
     }
+  }
+
+  /**
+   * 既有命令式流水线（`ORCHESTRATOR_ENABLED=false` 默认）：
+   * 双并发池 TTS+转码 → mux 合成 M4B → 收尾。
+   */
+  private async runImperative(
+    state: JobState,
+    jobDir: string,
+    isCanceled: () => boolean,
+  ): Promise<void> {
+    // 阶段一：TTS 合成 + 逐分片转码（双并发池流水线）
+    await this.pipeline.execute(state, jobDir, () => this.emitSnapshot(state), isCanceled);
+    if (isCanceled()) return;
+    // 阶段二：合成 M4B（委托模块 05：拼接 M4A + 章节元数据 + 封面，并做完整性校验）
+    state.phase = 'mux';
+    await saveJobState(jobDir, state);
+    this.emitSnapshot(state);
+    logger.info(`[job ${state.jobId}] 阶段 -> mux：合成 M4B`);
+    await assembleAudiobook(state, jobDir);
+    if (isCanceled()) return;
+    await this.finalizeJob(state, jobDir, isCanceled);
+  }
+
+  /**
+   * 编排器流水线（`ORCHESTRATOR_ENABLED=true`）：用 OOP Orchestrator 完成 tts+mux，
+   * 委托既有 `JobPipeline`/`assembleAudiobook` 作叶子执行器，复用 CheckpointStore 实现断点续传。
+   * 取消语义经 `isCanceled` 贯穿（pipeline 内未开始分片跳过；Audio Merger 检查取消）。
+   */
+  private async runOrchestrated(
+    state: JobState,
+    jobDir: string,
+    isCanceled: () => boolean,
+  ): Promise<void> {
+    logger.info(`[job ${state.jobId}] 编排器启动`);
+    const ctx: OrchestratorContext = {
+      jobState: state,
+      jobDir,
+      voice: state.voice,
+      onProgress: () => this.emitSnapshot(state),
+      isCanceled,
+      decisionClient: createDecisionClient(),
+      // Phase 1 自动放行 HITL 中断；Phase 2 置 true 启用人工审核
+      enableHumanReview: false,
+      // 委托既有 JobPipeline.execute：幂等跳过已完成分片，429 冷却/续传由 pipeline 继承
+      runTTSPhase: () =>
+        this.pipeline.execute(state, jobDir, () => this.emitSnapshot(state), isCanceled),
+    };
+    // 加载 checkpoint（缺失/损坏则空内存安全回退，从第一章重跑）
+    const checkpoint = await createCheckpointStore(jobDir);
+    const orch = new Orchestrator(ctx, checkpoint, {
+      projectId: state.jobId,
+      title: state.title,
+      inputChunks: state.chunks.map((c) => ({
+        index: c.index,
+        chapterIndex: c.chapterIndex,
+        chapterTitle: c.chapterTitle,
+        text: c.text,
+      })),
+    });
+    await orch.run();
+    if (isCanceled()) return;
+    // Orchestrator 已完成 tts+mux（mergeAudio 产出 output.m4b），收尾 uploading/validating/ready
+    await this.finalizeJob(state, jobDir, isCanceled);
+  }
+
+  /**
+   * 收尾阶段（两条路径共享）：可选 COS 卸载 → validating → ready。
+   * 复用既有契约：COS 失败不致任务失败（回退本地流式下载）。
+   */
+  private async finalizeJob(
+    state: JobState,
+    jobDir: string,
+    isCanceled: () => boolean,
+  ): Promise<void> {
+    // 卸载成品到 COS（开关开启、COS 已配置且尚未上传时）。上传走内网域名，快且不占公网出口。
+    // `COS_UPLOAD_ENABLED` 为总开关（默认 false）；`!state.remoteKey` 保证重跑/恢复时幂等跳过；
+    // 失败不致整任务失败——remoteKey 留空，下载回退本地流式。
+    if (config.COS_UPLOAD_ENABLED && objectStore.isEnabled() && !state.remoteKey) {
+      state.phase = 'uploading';
+      await saveJobState(jobDir, state);
+      this.emitSnapshot(state);
+      logger.info(`[job ${state.jobId}] 阶段 -> uploading：卸载成品到 COS`);
+      try {
+        await this.doUpload(state, jobDir, true);
+      } catch (uploadErr) {
+        logger.info(`[job ${state.jobId}] COS 上传失败，回退本地下载：`, uploadErr);
+      }
+      if (isCanceled()) return;
+    }
+    // 校验已在 assembleAudiobook 内完成，此处推进至就绪
+    state.phase = 'validating';
+    await saveJobState(jobDir, state);
+    this.emitSnapshot(state);
+    // 就绪，标记完成
+    state.phase = 'ready';
+    state.status = 'done';
+    await saveJobState(jobDir, state);
+    this.emitSnapshot(state);
+    logger.info(`[job ${state.jobId}] 任务完成（done）`);
   }
 
   // ==========================================================================
