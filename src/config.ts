@@ -224,7 +224,7 @@ export const config: Config = {
   ORCHESTRATOR_ENABLED: (process.env.ORCHESTRATOR_ENABLED || 'false') === 'true',
 
   // DeepSeek 文本决策模型配置（脚本情感/语速导演用；DEEPSEEK_API_KEY 留空则各决策节点走确定性兜底）
-  DEEPSEEK_MODEL: process.env.DEEPSEEK_MODEL || 'deepseek-v4-flash',
+  DEEPSEEK_MODEL: process.env.DEEPSEEK_MODEL || 'deepseek-v4-pro',
   DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY || '',
   DEEPSEEK_BASE_URL: process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1',
 };

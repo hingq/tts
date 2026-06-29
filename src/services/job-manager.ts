@@ -30,8 +30,6 @@ import { objectStore } from './object-store.js';
 import type { JobInfo, JobState, ChunkState } from '../types/job.js';
 import { logger } from '../utils/logger.js';
 import { Orchestrator } from '../orchestrator/orchestrator.js';
-import { createCheckpointStore } from '../orchestrator/checkpoint.js';
-import { createDecisionClient } from '../orchestrator/llm.js';
 import type { OrchestratorContext } from '../orchestrator/orchestrator.js';
 
 /** 终态集合：处于这些状态的任务不再推进。 */
@@ -424,7 +422,8 @@ export class JobManager extends EventEmitter {
     logger.info(`[job ${jobId}] 开始执行（${mode}流水线），共 ${state.totalChunks} 分片`);
     try {
       if (config.ORCHESTRATOR_ENABLED) {
-        await this.runOrchestrated(state, jobDir, isCanceled);
+        // 暂不处理
+        // await this.runOrchestrated(state, jobDir, isCanceled);
       } else {
         await this.runImperative(state, jobDir, isCanceled);
       }
@@ -467,42 +466,42 @@ export class JobManager extends EventEmitter {
    * 委托既有 `JobPipeline`/`assembleAudiobook` 作叶子执行器，复用 CheckpointStore 实现断点续传。
    * 取消语义经 `isCanceled` 贯穿（pipeline 内未开始分片跳过；Audio Merger 检查取消）。
    */
-  private async runOrchestrated(
-    state: JobState,
-    jobDir: string,
-    isCanceled: () => boolean,
-  ): Promise<void> {
-    logger.info(`[job ${state.jobId}] 编排器启动`);
-    const ctx: OrchestratorContext = {
-      jobState: state,
-      jobDir,
-      voice: state.voice,
-      onProgress: () => this.emitSnapshot(state),
-      isCanceled,
-      decisionClient: createDecisionClient(),
-      // Phase 1 自动放行 HITL 中断；Phase 2 置 true 启用人工审核
-      enableHumanReview: false,
-      // 委托既有 JobPipeline.execute：幂等跳过已完成分片，429 冷却/续传由 pipeline 继承
-      runTTSPhase: () =>
-        this.pipeline.execute(state, jobDir, () => this.emitSnapshot(state), isCanceled),
-    };
-    // 加载 checkpoint（缺失/损坏则空内存安全回退，从第一章重跑）
-    const checkpoint = await createCheckpointStore(jobDir);
-    const orch = new Orchestrator(ctx, checkpoint, {
-      projectId: state.jobId,
-      title: state.title,
-      inputChunks: state.chunks.map((c) => ({
-        index: c.index,
-        chapterIndex: c.chapterIndex,
-        chapterTitle: c.chapterTitle,
-        text: c.text,
-      })),
-    });
-    await orch.run();
-    if (isCanceled()) return;
-    // Orchestrator 已完成 tts+mux（mergeAudio 产出 output.m4b），收尾 uploading/validating/ready
-    await this.finalizeJob(state, jobDir, isCanceled);
-  }
+  // private async runOrchestrated(
+  //   state: JobState,
+  //   jobDir: string,
+  //   isCanceled: () => boolean,
+  // ): Promise<void> {
+  //   logger.info(`[job ${state.jobId}] 编排器启动`);
+  //   const ctx: OrchestratorContext = {
+  //     jobState: state,
+  //     jobDir,
+  //     voice: state.voice,
+  //     onProgress: () => this.emitSnapshot(state),
+  //     isCanceled,
+  //     // decisionClient: createDecisionClient(),
+  //     // Phase 1 自动放行 HITL 中断；Phase 2 置 true 启用人工审核
+  //     enableHumanReview: false,
+  //     // 委托既有 JobPipeline.execute：幂等跳过已完成分片，429 冷却/续传由 pipeline 继承
+  //     runTTSPhase: () =>
+  //       this.pipeline.execute(state, jobDir, () => this.emitSnapshot(state), isCanceled),
+  //   };
+  //   // 加载 checkpoint（缺失/损坏则空内存安全回退，从第一章重跑）
+  //   // const checkpoint = await createCheckpointStore(jobDir);
+  //   const orch = new Orchestrator(ctx, checkpoint, {
+  //     projectId: state.jobId,
+  //     title: state.title,
+  //     inputChunks: state.chunks.map((c) => ({
+  //       index: c.index,
+  //       chapterIndex: c.chapterIndex,
+  //       chapterTitle: c.chapterTitle,
+  //       text: c.text,
+  //     })),
+  //   });
+  //   await orch.run();
+  //   if (isCanceled()) return;
+  //   // Orchestrator 已完成 tts+mux（mergeAudio 产出 output.m4b），收尾 uploading/validating/ready
+  //   await this.finalizeJob(state, jobDir, isCanceled);
+  // }
 
   /**
    * 收尾阶段（两条路径共享）：可选 COS 卸载 → validating → ready。

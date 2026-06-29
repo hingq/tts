@@ -183,8 +183,8 @@ export class JobPipeline {
         const result = await provider.synthesize(
           chunk.text,
           {
-            voice: jobState.voice,
-            rate: jobState.rate,
+            voice: chunk.voiceId || jobState.voice,
+            rate: chunk.speedModifier ? String(chunk.speedModifier) : jobState.rate,
             pitch: jobState.pitch,
             bitrate: jobState.bitrate,
           },

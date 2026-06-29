@@ -54,6 +54,15 @@ export interface ChunkState {
   durationMs: number;
   /** 分片细分状态 */
   status: ChunkStatus;
+
+  /** 编排引擎分配的音色标识（可选） */
+  voiceId?: string;
+  /** 编排引擎分配的语速系数（可选） */
+  speedModifier?: number;
+  /** 编排引擎标注的情绪（可选） */
+  emotion?: string;
+  /** 编排引擎识别的说话人姓名或标识（可选） */
+  speaker?: string;
 }
 
 /**
