@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import { logger } from '../utils/logger.js';
-
+import type { JobState, ChunkState } from '../types/job.js';
+import type { IncomingChapterChunk } from '../types/orchestrator.js';
+import { saveJobState } from '../utils/state.js';
+import { assembleAudiobook } from '../utils/ffmpeg.js';
+import { config } from '../config.js';
+import path from 'node:path';
 // ─── 音色白名单 ──────────────────────────────────────────────────────
 
 const VOICE_WHITELIST = ['冰糖', '茉莉', '苏打', '白桦', 'mimo_default'] as const;
@@ -286,14 +291,6 @@ export class Model {
     }
   }
 }
-// ─── Orchestrator ─────────────────────────────────────────────────────
-
-import type { JobState, ChunkState } from '../types/job.js';
-import type { IncomingChapterChunk } from '../types/orchestrator.js';
-import { saveJobState } from '../utils/state.js';
-import { assembleAudiobook } from '../utils/ffmpeg.js';
-import { config } from '../config.js';
-import path from 'node:path';
 
 export interface OrchestratorContext {
   jobState: JobState;
@@ -301,14 +298,11 @@ export interface OrchestratorContext {
   voice: string;
   onProgress: () => void;
   isCanceled: () => boolean;
-  decisionClient?: unknown;
-  enableHumanReview: boolean;
   runTTSPhase: () => Promise<void>;
 }
 
 export class Orchestrator extends Model {
   private ctx: OrchestratorContext;
-  private checkpoint: unknown;
   private options: {
     projectId: string;
     title: string;
@@ -317,7 +311,6 @@ export class Orchestrator extends Model {
 
   constructor(
     ctx: OrchestratorContext,
-    checkpoint: unknown,
     options: {
       projectId: string;
       title: string;
@@ -333,14 +326,15 @@ export class Orchestrator extends Model {
     });
 
     this.ctx = ctx;
-    this.checkpoint = checkpoint;
     this.options = options;
   }
 
   /**
    * 1.1 将分片按 chapterIndex 分组并返回分组 Map
    */
-  private groupChunksByChapter(inputChunks: IncomingChapterChunk[]): Map<number, IncomingChapterChunk[]> {
+  private groupChunksByChapter(
+    inputChunks: IncomingChapterChunk[],
+  ): Map<number, IncomingChapterChunk[]> {
     const chaptersMap = new Map<number, IncomingChapterChunk[]>();
     for (const chunk of inputChunks) {
       if (!chaptersMap.has(chunk.chapterIndex)) {
@@ -354,7 +348,10 @@ export class Orchestrator extends Model {
   /**
    * 1.3 核心段落文本分割（触发 LLM 并在失败时自动回退兜底）
    */
-  private async segmentChapterText(chapterIndex: number, chapterChunks: IncomingChapterChunk[]): Promise<LlmSegment[]> {
+  private async segmentChapterText(
+    chapterIndex: number,
+    chapterChunks: IncomingChapterChunk[],
+  ): Promise<LlmSegment[]> {
     const chapterText = chapterChunks.map((c) => c.text).join('');
     logger.info(`[Orchestrator] Chapter ${chapterIndex} text length: ${chapterText.length}`);
 
@@ -369,9 +366,14 @@ export class Orchestrator extends Model {
   /**
    * 1.3 尝试调用 LLM 进行分段
    */
-  private async callLlmSegmentation(chapterText: string, chapterIndex: number): Promise<LlmSegment[] | null> {
+  private async callLlmSegmentation(
+    chapterText: string,
+    chapterIndex: number,
+  ): Promise<LlmSegment[] | null> {
     if (!config.DEEPSEEK_API_KEY) {
-      logger.info(`[Orchestrator] No DEEPSEEK_API_KEY configured, using deterministic fallback chunks.`);
+      logger.info(
+        `[Orchestrator] No DEEPSEEK_API_KEY configured, using deterministic fallback chunks.`,
+      );
       return null;
     }
 
@@ -380,11 +382,15 @@ export class Orchestrator extends Model {
     const llmResult = await super.runModel();
 
     if (llmResult && llmResult.segments && llmResult.segments.length > 0) {
-      logger.info(`[Orchestrator] LLM segmentation succeeded with ${llmResult.segments.length} segments.`);
+      logger.info(
+        `[Orchestrator] LLM segmentation succeeded with ${llmResult.segments.length} segments.`,
+      );
       return llmResult.segments;
     }
 
-    logger.error(`[Orchestrator] LLM segmentation returned null, falling back to deterministic chunks.`);
+    logger.error(
+      `[Orchestrator] LLM segmentation returned null, falling back to deterministic chunks.`,
+    );
     return null;
   }
 
@@ -496,7 +502,12 @@ export class Orchestrator extends Model {
       }
 
       const chapterChunks = chaptersMap.get(chapterIndex)!;
-      const chapterNewChunks = await this.processChapter(chapterIndex, chapterChunks, jobDir, globalIndex);
+      const chapterNewChunks = await this.processChapter(
+        chapterIndex,
+        chapterChunks,
+        jobDir,
+        globalIndex,
+      );
       allNewChunks.push(...chapterNewChunks);
       globalIndex += chapterNewChunks.length;
     }
@@ -509,7 +520,9 @@ export class Orchestrator extends Model {
     jobState.completedTTS = 0;
     jobState.completedTranscode = 0;
 
-    logger.info(`[Orchestrator] Handled output text. Reconstructed ${jobState.totalChunks} chunks.`);
+    logger.info(
+      `[Orchestrator] Handled output text. Reconstructed ${jobState.totalChunks} chunks.`,
+    );
 
     // 3. 执行 TTS 阶段
     await this.runTtsPhase();
