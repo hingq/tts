@@ -7,7 +7,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 
 # Install all dependencies (including devDependencies) to build TypeScript
-RUN npm ci
+RUN npm install
 
 # Copy configuration and source files
 COPY tsconfig.json build.js eslint.config.js ./
