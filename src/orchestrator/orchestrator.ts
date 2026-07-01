@@ -51,13 +51,11 @@ const LlmSegmentationOutputSchema = z.object({
 type LlmSegmentationOutput = z.infer<typeof LlmSegmentationOutputSchema>;
 type LlmSegment = z.infer<typeof LlmSegmentSchema>;
 
-// ─── Model ────────────────────────────────────────────────────────────
-type Config = {
+// ─── LlmSegmentationClient ────────────────────────────────────────────
+type LlmClientConfig = {
   url: string;
   model: string;
   api_key: string;
-  system_prompt: string;
-  text: string;
 };
 const prompt = `
   你是中文有声书制作流水线中的「脚本对齐」引擎。输入是小说某一章的原文，你的唯一任务是把这段原文逐字切分成有序的朗读脚本片段（segments），同时识别
@@ -104,28 +102,28 @@ const prompt = `
   再次提醒：底线是「拼接还原原文（字字保真）」与「尽可能把角色心声识别为该角色，而非旁白」。
   若为兼顾保真需要牺牲切分美观度，优先保真。
   `;
-export class Model {
-  protected base_url: string;
-  protected model: string;
-  protected api_key: string;
-  protected system_prompt: string;
-  protected text: string;
-  constructor(config: Config) {
+
+export class LlmSegmentationClient {
+  private readonly base_url: string;
+  private readonly model: string;
+  private readonly api_key: string;
+  private readonly system_prompt: string;
+
+  constructor(config: LlmClientConfig) {
     this.base_url = config.url;
     this.model = config.model;
     this.api_key = config.api_key;
     this.system_prompt = prompt;
-    this.text = config.text;
   }
 
   /**
    * 文本完整性校验：所有 segments[].text 拼接后必须逐字等于原文。
    * 这是有声书制作的核心约束——漏字会导致音频缺失、字数对不上。
    */
-  private validateTextIntegrity(segments: { text: string }[]): boolean {
+  private validateTextIntegrity(segments: { text: string }[], originalText: string): boolean {
     const reconstructed = segments.map((s) => s.text).join('');
     const norm = (s: string) => s.replace(/\s+/g, '');
-    return norm(reconstructed) === norm(this.text);
+    return norm(reconstructed) === norm(originalText);
   }
 
   /**
@@ -137,85 +135,16 @@ export class Model {
   }
 
   /**
-   * 规则化分配音色：
-   *  - narrator → 苏打
-   *  - 角色按 gender 在同性音色池里按 segments 首现顺序轮询（女→冰糖/茉莉，男→苏打/白桦）
-   *  - gender 缺失/未知 → mimo_default
-   * 由本函数统一决定 voiceId，保证同一角色在本章及全书稳定、同性别的不同角色尽量区分，
-   * 彻底避免「同角色音色漂移」与「LLM 随机挑音色」两类问题。
-   * 返回重建后的 characters 表（voiceId 已规则化）。
-   */
-  private assignVoices(
-    segments: { speaker: string; voiceId?: string }[],
-    characters: { id: string; gender?: string }[],
-  ): { id: string; voiceId: VoiceId; gender?: string }[] {
-    const genderOf = new Map(characters.map((c) => [c.id, c.gender]));
-
-    // 按 segments 首现顺序收集去重角色（保证全书只要角色识别一致，音色就稳定）
-    const order: string[] = [];
-    const seen = new Set<string>();
-    for (const s of segments) {
-      if (s.speaker === 'narrator' || seen.has(s.speaker)) continue;
-      seen.add(s.speaker);
-      order.push(s.speaker);
-    }
-
-    // 为每个角色派生稳定 voiceId
-    const voiceOf = new Map<string, VoiceId>();
-    const counters: Record<'女性' | '男性', number> = { 女性: 0, 男性: 0 };
-    for (const id of order) {
-      const gender = genderOf.get(id);
-      let voice: VoiceId = FALLBACK_VOICE;
-      if (gender === '女性') {
-        voice = FEMALE_VOICES[counters['女性']++ % FEMALE_VOICES.length] ?? FALLBACK_VOICE;
-      } else if (gender === '男性') {
-        voice = MALE_VOICES[counters['男性']++ % MALE_VOICES.length] ?? FALLBACK_VOICE;
-      }
-      voiceOf.set(id, voice);
-    }
-
-    // 回填 segments：narrator 固定苏打，其余查表
-    for (const s of segments) {
-      s.voiceId =
-        s.speaker === 'narrator' ? NARRATOR_VOICE : (voiceOf.get(s.speaker) ?? FALLBACK_VOICE);
-    }
-
-    // 重建 characters 表：去重、带规则化 voiceId 与原 gender
-    return order.map((id) => ({
-      id,
-      voiceId: voiceOf.get(id) ?? FALLBACK_VOICE,
-      gender: genderOf.get(id),
-    }));
-  }
-
-  /**
-   * speedModifier 钳位：将超出 [0.5, 2.0] 的值钳回范围，NaN → 1.0。
-   */
-  private clampSpeedModifier(segments: { speedModifier: number }[]): void {
-    for (const seg of segments) {
-      if (typeof seg.speedModifier !== 'number' || Number.isNaN(seg.speedModifier)) {
-        seg.speedModifier = 1;
-      } else {
-        seg.speedModifier = Math.min(2, Math.max(0.5, seg.speedModifier));
-      }
-    }
-  }
-
-  /**
-   * 调用 LLM 进行文本分段和音色分配，返回经过多层校验的类型化结果。
-   *
-   * 校验链（任一层失败 → return null，调用方回退确定性 narrator）：
-   *    HTTP 响应码 + 30s 超时
+   * 调用 LLM 进行文本分段，返回经过基础校验的类型化结果。
+   * 校验链（任一层失败 → return null）：
+   *    HTTP 响应码 + 120s 超时
    *   JSON 响应解析（`response.choices[0].message.content`）
    *    Zod schema 结构校验（字段类型、enum 白名单）
    *   文本完整性（拼接 segments.text 逐字等于原文）
    *    Index 连续性（严格 0, 1, 2...）
-   *    音色规则化分配（assignVoices，确定性，不触发回退）
    */
-  async runModel(): Promise<LlmSegmentationOutput | null> {
+  async segment(text: string): Promise<LlmSegmentationOutput | null> {
     const controller = new AbortController();
-    // 逐句切分输出体量大（segments JSON 可达数千 token），非流式 + 中转网关下 30s 偏紧。
-    // 若长期命中超时，根治方向是改 stream:true 流式接收；当前先放宽到 120s。
     const timeout = setTimeout(() => controller.abort(), 120_000);
 
     try {
@@ -229,7 +158,7 @@ export class Model {
           model: this.model,
           messages: [
             { role: 'system', content: this.system_prompt },
-            { role: 'user', content: this.text },
+            { role: 'user', content: text },
           ],
           stream: false,
           response_format: SEGMENTATION_RESPONSE_FORMAT,
@@ -265,7 +194,7 @@ export class Model {
       const { segments, characters } = parseResult.data;
 
       // L6: 文本完整性 + Index 连续性
-      if (!this.validateTextIntegrity(segments)) {
+      if (!this.validateTextIntegrity(segments, text)) {
         logger.error('[orchestrator] 分割输出文本完整性校验失败');
         return null;
       }
@@ -274,13 +203,7 @@ export class Model {
         return null;
       }
 
-      // L7: 规则化音色分配（覆盖 LLM 的 voiceId，保证全书稳定，不触发回退）
-      const normalizedCharacters = this.assignVoices(segments, characters);
-
-      // 钳位 speedModifier 到 [0.5, 2.0]
-      this.clampSpeedModifier(segments);
-
-      return { segments, characters: normalizedCharacters };
+      return { segments, characters };
     } catch (err) {
       logger.error(
         `[orchestrator] 分割 LLM 调用失败：${err instanceof Error ? err.message : String(err)}`,
@@ -301,13 +224,18 @@ export interface OrchestratorContext {
   runTTSPhase: () => Promise<void>;
 }
 
-export class Orchestrator extends Model {
+export class Orchestrator {
   private ctx: OrchestratorContext;
   private options: {
     projectId: string;
     title: string;
     inputChunks: IncomingChapterChunk[];
   };
+  private segmentationClient: LlmSegmentationClient;
+
+  // 全局音色映射与计数器（跨章节复用，解决音色漂移）
+  private globalVoiceMap = new Map<string, VoiceId>();
+  private globalCounters: Record<'女性' | '男性', number> = { 女性: 0, 男性: 0 };
 
   constructor(
     ctx: OrchestratorContext,
@@ -317,16 +245,78 @@ export class Orchestrator extends Model {
       inputChunks: IncomingChapterChunk[];
     },
   ) {
-    super({
+    this.ctx = ctx;
+    this.options = options;
+    this.segmentationClient = new LlmSegmentationClient({
       url: config.DEEPSEEK_BASE_URL,
       model: config.DEEPSEEK_MODEL,
       api_key: config.DEEPSEEK_API_KEY,
-      system_prompt: '', // Model constructor overrides this anyway with internal prompt
-      text: '', // Set per chapter dynamically
     });
+  }
 
-    this.ctx = ctx;
-    this.options = options;
+  /**
+   * 规则化分配音色：
+   *  - narrator → 苏打
+   *  - 角色按 gender 在同性音色池里按 segments 首现顺序轮询（女→冰糖/茉莉，男→苏打/白桦）
+   *  - gender 缺失/未知 → mimo_default
+   * 由本函数统一决定 voiceId，保证同一角色在本章及全书稳定、同性别的不同角色尽量区分，
+   * 彻底避免「同角色音色漂移」与「LLM 随机挑音色」两类问题。
+   * 返回重建后的 characters 表（voiceId 已规则化）。
+   */
+  private assignVoices(
+    segments: { speaker: string; voiceId?: string }[],
+    characters: { id: string; gender?: string }[],
+  ): { id: string; voiceId: VoiceId; gender?: string }[] {
+    const genderOf = new Map(characters.map((c) => [c.id, c.gender]));
+
+    // 按 segments 首现顺序收集去重角色（保证全书只要角色识别一致，音色就稳定）
+    const order: string[] = [];
+    const seen = new Set<string>();
+    for (const s of segments) {
+      if (s.speaker === 'narrator' || seen.has(s.speaker)) continue;
+      seen.add(s.speaker);
+      order.push(s.speaker);
+    }
+
+    // 为本章每个新角色派生并记录稳定 voiceId，已分配过的直接复用以解决音色漂移问题
+    for (const id of order) {
+      if (this.globalVoiceMap.has(id)) continue;
+
+      const gender = genderOf.get(id);
+      let voice: VoiceId = FALLBACK_VOICE;
+      if (gender === '女性') {
+        voice = FEMALE_VOICES[this.globalCounters['女性']++ % FEMALE_VOICES.length] ?? FALLBACK_VOICE;
+      } else if (gender === '男性') {
+        voice = MALE_VOICES[this.globalCounters['男性']++ % MALE_VOICES.length] ?? FALLBACK_VOICE;
+      }
+      this.globalVoiceMap.set(id, voice);
+    }
+
+    // 回填 segments：narrator 固定苏打，其余查全局映射表
+    for (const s of segments) {
+      s.voiceId =
+        s.speaker === 'narrator' ? NARRATOR_VOICE : (this.globalVoiceMap.get(s.speaker) ?? FALLBACK_VOICE);
+    }
+
+    // 重建 characters 表：去重、带规则化 voiceId 与原 gender
+    return order.map((id) => ({
+      id,
+      voiceId: this.globalVoiceMap.get(id) ?? FALLBACK_VOICE,
+      gender: genderOf.get(id),
+    }));
+  }
+
+  /**
+   * speedModifier 钳位：将超出 [0.5, 2.0] 的值钳回范围，NaN → 1.0。
+   */
+  private clampSpeedModifier(segments: { speedModifier: number }[]): void {
+    for (const seg of segments) {
+      if (typeof seg.speedModifier !== 'number' || Number.isNaN(seg.speedModifier)) {
+        seg.speedModifier = 1;
+      } else {
+        seg.speedModifier = Math.min(2, Math.max(0.5, seg.speedModifier));
+      }
+    }
   }
 
   /**
@@ -377,14 +367,16 @@ export class Orchestrator extends Model {
       return null;
     }
 
-    this.text = chapterText;
     logger.info(`[Orchestrator] Calling DeepSeek LLM for chapter ${chapterIndex}...`);
-    const llmResult = await super.runModel();
+    const llmResult = await this.segmentationClient.segment(chapterText);
 
     if (llmResult && llmResult.segments && llmResult.segments.length > 0) {
       logger.info(
         `[Orchestrator] LLM segmentation succeeded with ${llmResult.segments.length} segments.`,
       );
+      // 在 Orchestrator 内部运行业务分配规则与钳位
+      this.assignVoices(llmResult.segments, llmResult.characters);
+      this.clampSpeedModifier(llmResult.segments);
       return llmResult.segments;
     }
 
