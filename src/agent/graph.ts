@@ -12,6 +12,7 @@ import { createReactAgent } from '@langchain/langgraph/prebuilt';
 import { MemorySaver } from '@langchain/langgraph';
 import type { Checkpoint, CheckpointMetadata } from '@langchain/langgraph-checkpoint';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import { SystemMessage, type BaseMessage } from '@langchain/core/messages';
 import { config } from '../config.js';
 import { createChatModel } from './model.js';
 import { agentTools } from './tools.js';
@@ -30,22 +31,13 @@ const SYSTEM_PROMPT = [
 ].join('\n');
 
 /**
- * 带容量限制和消息历史裁剪的进程内 Checkpointer。
- *
- * 解决两个生产级隐患：
- * 1. **内存泄漏**：通过 LRU 队列将活跃会话数量限制在 `maxThreads` 以内，
- *    超额时自动调用 `deleteThread` 清理最老的会话检查点。
- * 2. **上下文爆表**：在写入检查点前裁剪 `messages` 通道，仅保留最近的
- *    `maxMessages` 条（系统提示词在每次运行图时动态附加，无需纳入历史）。
+ * 带容量限制的进程内 Checkpointer。
  */
 class LimitedMemorySaver extends MemorySaver {
   /** 按 LRU 顺序排列的活跃 threadId（队尾为最近访问） */
   private readonly threadOrder: string[] = [];
 
-  constructor(
-    private readonly maxThreads = 20,
-    private readonly maxMessages = 10,
-  ) {
+  constructor(private readonly maxThreads = 20) {
     super();
   }
 
@@ -58,7 +50,6 @@ class LimitedMemorySaver extends MemorySaver {
 
     if (threadId) {
       this.touchThread(threadId);
-      this.pruneMessages(checkpoint);
     }
 
     return super.put(cfg, checkpoint, metadata);
@@ -78,21 +69,30 @@ class LimitedMemorySaver extends MemorySaver {
       });
     }
   }
-
-  /** 若 messages 通道超出上限，截取最近 maxMessages 条。 */
-  private pruneMessages(checkpoint: Checkpoint): void {
-    const msgs = checkpoint.channel_values?.messages;
-    if (Array.isArray(msgs) && msgs.length > this.maxMessages) {
-      checkpoint.channel_values.messages = msgs.slice(-this.maxMessages);
-    }
-  }
 }
 
 /**
  * 进程内 Checkpointer（重启即丢失）。
- * 限制最多 20 个活跃会话，每个会话最多保留最近 10 条消息历史。
+ * 限制最多 20 个活跃会话。
  */
-const checkpointer = new LimitedMemorySaver(20, 10);
+const checkpointer = new LimitedMemorySaver(20);
+const MAX_MESSAGES = 10;
+
+/**
+ * 安全修剪消息历史，避免切断 ToolCall 与 ToolMessage
+ */
+function pruneMessages(messages: BaseMessage[], maxMsgs: number): BaseMessage[] {
+  if (messages.length <= maxMsgs) return messages;
+
+  let sliceIdx = messages.length - maxMsgs;
+
+  // 往前回溯，直到避开连续的 tool messages
+  while (sliceIdx > 0 && messages[sliceIdx]._getType() === 'tool') {
+    sliceIdx--;
+  }
+
+  return messages.slice(sliceIdx);
+}
 
 let agent: ReturnType<typeof createReactAgent> | undefined;
 
@@ -105,7 +105,11 @@ export function getAgent(): ReturnType<typeof createReactAgent> {
     agent = createReactAgent({
       llm: createChatModel(),
       tools: agentTools,
-      prompt: SYSTEM_PROMPT,
+      // 使用 stateModifier 安全过滤历史并注入系统提示
+      stateModifier: (state: { messages: BaseMessage[] }) => {
+        const pruned = pruneMessages(state.messages, MAX_MESSAGES);
+        return [new SystemMessage(SYSTEM_PROMPT), ...pruned];
+      },
       checkpointer,
     });
   }
