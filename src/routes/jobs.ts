@@ -16,7 +16,7 @@ import { JobManager, JobCreationError, IncomingChunk } from '../services/job-man
 import { objectStore } from '../services/object-store.js';
 import { JobInfo } from '../types/job.js';
 import { config } from '../config.js';
-import { getAgent, RECURSION_LIMIT } from '../agent/graph.js';
+import { getAgent } from '../agent/agent.js';
 
 /** 合法 TTS 引擎枚举（用于校验服务端 env 配置，非前端入参）。 */
 const ENGINE_WHITELIST = ['edge-tts', 'mimo-tts'];
@@ -404,7 +404,7 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
 
       let agent: ReturnType<typeof getAgent>;
       try {
-        agent = getAgent();
+        agent = getAgent(threadId);
       } catch (err) {
         // 缺 key / provider 不支持等配置问题：明确 503，避免吞错。
         return reply.code(503).send({
@@ -415,49 +415,46 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
 
       reply.sse({ event: 'handshake', data: JSON.stringify({ threadId }) });
 
-      const controller = new AbortController();
       let cleaned = false;
       const heartbeat = setInterval(() => reply.sse({ comment: 'keepalive' }), 20_000);
+
+      const unsubscribe = agent.subscribe((event) => {
+        if (cleaned) return;
+        if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') {
+          reply.sse({ event: 'ai-stream', data: escapeSseText(event.assistantMessageEvent.delta) });
+        } else if (event.type === 'tool_execution_start') {
+          reply.sse({
+            event: 'tool-call',
+            data: JSON.stringify({ name: event.toolName, input: event.args }),
+          });
+        } else if (event.type === 'tool_execution_end') {
+          // 提取文本内容或者直接返回序列化的 result
+          const contentArray = (event.result as any)?.content;
+          const textContent = Array.isArray(contentArray)
+            ? contentArray.find((c: any) => c.type === 'text')?.text
+            : undefined;
+          reply.sse({
+            event: 'tool-result',
+            data: JSON.stringify({
+              name: event.toolName,
+              output: textContent || JSON.stringify(event.result),
+            }),
+          });
+        }
+      });
+
       const cleanup = (): void => {
         if (cleaned) return;
         cleaned = true;
         clearInterval(heartbeat);
-        controller.abort(); // 触发中止信号，向下游 LLM 及工具执行链进行传播
+        agent.abort(); // 触发中止信号，停止当前 turn 的 LLM 及工具执行
+        unsubscribe();
         reply.sseContext.source.end();
       };
       request.raw.on('close', cleanup);
 
       try {
-        const stream = agent.streamEvents(
-          { messages: [{ role: 'user', content: message }] },
-          {
-            version: 'v2',
-            configurable: { thread_id: threadId },
-            recursionLimit: RECURSION_LIMIT,
-            signal: controller.signal, // 传递 AbortSignal
-          },
-        );
-        for await (const ev of stream) {
-          if (cleaned) break;
-          if (ev.event === 'on_chat_model_stream') {
-            const text = extractChunkText(ev.data?.chunk);
-            if (text) reply.sse({ event: 'ai-stream', data: escapeSseText(text) });
-          } else if (ev.event === 'on_tool_start') {
-            reply.sse({
-              event: 'tool-call',
-              data: JSON.stringify({ name: ev.name, input: ev.data?.input }),
-            });
-          } else if (ev.event === 'on_tool_end') {
-            const output = ev.data?.output;
-            reply.sse({
-              event: 'tool-result',
-              data: JSON.stringify({
-                name: ev.name,
-                output: typeof output === 'string' ? output : (output?.content ?? output),
-              }),
-            });
-          }
-        }
+        await agent.prompt(message);
         if (!cleaned) reply.sse({ event: 'ai-complete', data: 'done' });
       } catch (err) {
         if (!cleaned) {

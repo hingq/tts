@@ -15,6 +15,16 @@ function getTool(name: string) {
   return t;
 }
 
+async function invokeTool(name: string, args: any) {
+  const t = getTool(name);
+  const result = await t.execute('test-call-id', args, new AbortController().signal, undefined);
+  if (!result || !result.content || result.content.length === 0) {
+    throw new Error('Tool returned no content');
+  }
+  const textContent = (result.content.find((c: any) => c.type === 'text') as any)?.text;
+  return textContent;
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
@@ -23,8 +33,8 @@ describe('agent tools', () => {
   it('list_jobs 透传 JobManager.listJobs 结果', async () => {
     const fake = [{ jobId: 'a', status: 'running', title: '书' }];
     vi.spyOn(JobManager.getInstance(), 'listJobs').mockResolvedValue(fake as never);
-    const out = await getTool('list_jobs').invoke({});
-    expect(JSON.parse(out as string)).toEqual(fake);
+    const out = await invokeTool('list_jobs', {});
+    expect(JSON.parse(out)).toEqual(fake);
   });
 
   it('get_job_status 裁剪 JobInfo，剔除引擎/音色细节', async () => {
@@ -48,7 +58,7 @@ describe('agent tools', () => {
       bitrate: '64k',
     };
     vi.spyOn(JobManager.getInstance(), 'getJob').mockReturnValue(info);
-    const out = JSON.parse((await getTool('get_job_status').invoke({ jobId: 'a' })) as string);
+    const out = JSON.parse(await invokeTool('get_job_status', { jobId: 'a' }));
     expect(out).toEqual({
       jobId: 'a',
       status: 'running',
@@ -65,19 +75,19 @@ describe('agent tools', () => {
 
   it('get_job_status 任务不存在返回 not_found', async () => {
     vi.spyOn(JobManager.getInstance(), 'getJob').mockReturnValue(undefined);
-    const out = JSON.parse((await getTool('get_job_status').invoke({ jobId: 'x' })) as string);
+    const out = JSON.parse(await invokeTool('get_job_status', { jobId: 'x' }));
     expect(out).toEqual({ error: 'not_found', jobId: 'x' });
   });
 
   it('cancel_job 透传布尔结果', async () => {
     vi.spyOn(JobManager.getInstance(), 'cancelJob').mockReturnValue(true);
-    const out = JSON.parse((await getTool('cancel_job').invoke({ jobId: 'a' })) as string);
+    const out = JSON.parse(await invokeTool('cancel_job', { jobId: 'a' }));
     expect(out).toEqual({ jobId: 'a', canceled: true });
   });
 
   it('resume_job 透传枚举结果', async () => {
     vi.spyOn(JobManager.getInstance(), 'resumeJob').mockReturnValue('invalid_state');
-    const out = JSON.parse((await getTool('resume_job').invoke({ jobId: 'a' })) as string);
+    const out = JSON.parse(await invokeTool('resume_job', { jobId: 'a' }));
     expect(out).toEqual({ jobId: 'a', result: 'invalid_state' });
   });
 });

@@ -38,7 +38,7 @@ let gcTimer: NodeJS.Timeout | undefined;
 /**
  * 统一错误处理器：把未捕获异常归一为 { error, message } 响应体（契约见 plan.md 4.1）。
  */
-fastify.setErrorHandler((err, _request, reply) => {
+fastify.setErrorHandler((err: any, _request, reply) => {
   // multipart 超出 fileSize 限制时抛 FST_REQ_FILE_TOO_LARGE，归一为其携带的 413
   const status = err.statusCode && err.statusCode >= 400 ? err.statusCode : 500;
   fastify.log.error(err);
