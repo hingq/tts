@@ -1,9 +1,9 @@
 /**
  * @file orchestrator.ts
- * @description V2 编排图（`src/orchestrator/`）的类型契约与 `zod` 校验 schema。
+ * @description V2 编排图（`src/orchestrator/`）的类型契约与 TypeBox 校验 schema。
  *
  * 设计要点（见 `openspec/changes/langgraph-audiobook-pipeline/` 的 proposal/design/spec）：
- * - 类型与 schema 同源：用 `z.infer` 从 schema 推导类型，保证「运行时校验」与「编译期类型」天然对齐，
+ * - 类型与 schema 同源：用 `Static` 从 schema 推导类型，保证「运行时校验」与「编译期类型」天然对齐，
  *   杜绝二者漂移。节点输出经 schema 校验后才写回状态。
  * - `ScriptLine` 是逐句脚本单元：保留原文 `text`（**不可被决策节点改动**，否则破坏字符级对齐），
  *   外挂决策产物 `emotion` / `speedModifier`（DeepSeek 注入，失败回退 `neutral` / `1.0`）与可选 `ssml`（Phase 2 音素）。
@@ -15,7 +15,7 @@
  * （SSE/GC/recovery 已消费它）；此处仅描述**阶段级**的编排状态。
  */
 
-import { z } from 'zod';
+import { Type, type Static } from 'typebox';
 
 // ─── 脚本单元 ────────────────────────────────────────────────────
 
@@ -23,34 +23,34 @@ import { z } from 'zod';
  * 单句脚本行。`text` 为对应原文片段（拼接后须逐字等于章节原文）；
  * `emotion` / `speedModifier` 由 Script Director 注入；`ssml` 留给 Phase 2 音素修正。
  */
-export const ScriptLineSchema = z.object({
+export const ScriptLineSchema = Type.Object({
   /** 脚本行序号（章内从 0 开始） */
-  index: z.number().int().nonnegative(),
+  index: Type.Integer({ minimum: 0 }),
   /** 说话人标识：`narrator` 或具名角色 id */
-  speaker: z.string().min(1),
+  speaker: Type.String({ minLength: 1 }),
   /** 原文片段，**决策节点不得改动** */
-  text: z.string(),
+  text: Type.String(),
   /** 情绪标签（如 `neutral` / `happy` / `sad`）；缺失或非法时回退 `neutral` */
-  emotion: z.string().min(1).default('neutral'),
+  emotion: Type.String({ minLength: 1, default: 'neutral' }),
   /** 语速系数，`1.0` 为原速；缺失或非法时回退 `1.0` */
-  speedModifier: z.number().positive().default(1),
+  speedModifier: Type.Number({ exclusiveMinimum: 0, default: 1 }),
   /** 可选 SSML 音素修正串（Phase 2 g2pW 引擎产物） */
-  ssml: z.string().optional(),
+  ssml: Type.Optional(Type.String()),
 });
 
-export type ScriptLine = z.infer<typeof ScriptLineSchema>;
+export type ScriptLine = Static<typeof ScriptLineSchema>;
 
 /**
  * 一章的脚本清单：本章全部脚本行的有序集合。拼接各 `line.text` 须逐字等于章节原文。
  */
-export const ScriptManifestSchema = z.object({
+export const ScriptManifestSchema = Type.Object({
   /** 所属章节序号（从 0 开始） */
-  chapterIndex: z.number().int().nonnegative(),
+  chapterIndex: Type.Integer({ minimum: 0 }),
   /** 本章脚本行（按 `index` 升序） */
-  lines: z.array(ScriptLineSchema),
+  lines: Type.Array(ScriptLineSchema),
 });
 
-export type ScriptManifest = z.infer<typeof ScriptManifestSchema>;
+export type ScriptManifest = Static<typeof ScriptManifestSchema>;
 
 // ─── 角色注册表 ──────────────────────────────────────────────────
 
@@ -58,30 +58,30 @@ export type ScriptManifest = z.infer<typeof ScriptManifestSchema>;
  * 单个角色的画像。`voiceId` 一旦绑定即视为全书固定（reducer 不覆盖）；
  * Phase 1 具名角色可塌缩为任务 voice，故 `voiceId` 可选。
  */
-export const CharacterProfileSchema = z.object({
+export const CharacterProfileSchema = Type.Object({
   /** 身份键（说话人标识，与 `ScriptLine.speaker` 对齐） */
-  id: z.string().min(1),
+  id: Type.String({ minLength: 1 }),
   /** 绑定音色；首次绑定后跨章稳定 */
-  voiceId: z.string().optional(),
+  voiceId: Type.Optional(Type.String()),
   /** 性别（Phase 2 角色匹配用） */
-  gender: z.string().optional(),
+  gender: Type.Optional(Type.String()),
   /** 年龄段（Phase 2 角色匹配用） */
-  ageGroup: z.string().optional(),
+  ageGroup: Type.Optional(Type.String()),
   /** 风格标签（Phase 2 角色匹配用） */
-  tags: z.array(z.string()).optional(),
+  tags: Type.Optional(Type.Array(Type.String())),
   /** 声纹/文本向量（Phase 2 pgvector 注册表用） */
-  embedding: z.array(z.number()).optional(),
+  embedding: Type.Optional(Type.Array(Type.Number())),
 });
 
-export type CharacterProfile = z.infer<typeof CharacterProfileSchema>;
+export type CharacterProfile = Static<typeof CharacterProfileSchema>;
 
 /**
  * 全书角色注册表：`身份键 → 画像`。由自定义 reducer 跨章增量合并，
  * 已绑定 `voiceId` 的条目在合并时不被覆盖。
  */
-export const CharacterRegistrySchema = z.record(z.string(), CharacterProfileSchema);
+export const CharacterRegistrySchema = Type.Record(Type.String(), CharacterProfileSchema);
 
-export type CharacterRegistry = z.infer<typeof CharacterRegistrySchema>;
+export type CharacterRegistry = Static<typeof CharacterRegistrySchema>;
 
 // ─── 章节分组（Chapter Splitter 产物） ──────────────────────────
 

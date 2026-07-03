@@ -1,4 +1,5 @@
-import { z } from 'zod';
+import { Type, type Static } from 'typebox';
+import { Check, Default, Errors } from 'typebox/value';
 import { logger } from '../utils/logger.js';
 import type { JobState, ChunkState } from '../types/job.js';
 import type { IncomingChapterChunk } from '../types/orchestrator.js';
@@ -22,34 +23,41 @@ const SEGMENTATION_RESPONSE_FORMAT = {
   type: 'json_object' as const,
 } as const;
 
-// ─── LLM 输出 Zod 校验 Schema ───────────────────────────────────────
+// ─── LLM 输出 TypeBox 校验 Schema ────────────────────────────────────
 
-const LlmSegmentSchema = z.object({
-  index: z.number().int().nonnegative(),
-  text: z.string().min(1),
-  speaker: z.string().min(1),
+const VoiceIdSchema = Type.Union([
+  Type.Literal('冰糖'),
+  Type.Literal('茉莉'),
+  Type.Literal('苏打'),
+  Type.Literal('白桦'),
+  Type.Literal('mimo_default'),
+]);
+
+const LlmSegmentSchema = Type.Object({
+  index: Type.Integer({ minimum: 0 }),
+  text: Type.String({ minLength: 1 }),
+  speaker: Type.String({ minLength: 1 }),
   // voiceId 由下游 assignVoices 规则统一分配；LLM 可不填，填了也会被覆盖
-  voiceId: z.enum(VOICE_WHITELIST).optional(),
-  emotion: z.string().min(1).default('neutral'),
-  speedModifier: z.number().positive().default(1),
+  voiceId: Type.Optional(VoiceIdSchema),
+  emotion: Type.String({ minLength: 1, default: 'neutral' }),
+  speedModifier: Type.Number({ exclusiveMinimum: 0, default: 1 }),
 });
 
-const LlmSegmentationOutputSchema = z.object({
-  segments: z.array(LlmSegmentSchema).min(1),
-  characters: z
-    .array(
-      z.object({
-        id: z.string().min(1),
-        // voiceId 同样由下游规则分配，LLM 只需保证 gender 准确
-        voiceId: z.enum(VOICE_WHITELIST).optional(),
-        gender: z.string().optional(),
-      }),
-    )
-    .default([]),
+const LlmSegmentationOutputSchema = Type.Object({
+  segments: Type.Array(LlmSegmentSchema, { minItems: 1 }),
+  characters: Type.Array(
+    Type.Object({
+      id: Type.String({ minLength: 1 }),
+      // voiceId 同样由下游规则分配，LLM 只需保证 gender 准确
+      voiceId: Type.Optional(VoiceIdSchema),
+      gender: Type.Optional(Type.String()),
+    }),
+    { default: [] },
+  ),
 });
 
-type LlmSegmentationOutput = z.infer<typeof LlmSegmentationOutputSchema>;
-type LlmSegment = z.infer<typeof LlmSegmentSchema>;
+type LlmSegmentationOutput = Static<typeof LlmSegmentationOutputSchema>;
+type LlmSegment = Static<typeof LlmSegmentSchema>;
 
 // ─── LlmSegmentationClient ────────────────────────────────────────────
 type LlmClientConfig = {
@@ -137,15 +145,15 @@ export class LlmSegmentationClient {
   /**
    * 调用 LLM 进行文本分段，返回经过基础校验的类型化结果。
    * 校验链（任一层失败 → return null）：
-   *    HTTP 响应码 + 120s 超时
+   *    HTTP 响应码 + 可配置超时
    *   JSON 响应解析（`response.choices[0].message.content`）
-   *    Zod schema 结构校验（字段类型、enum 白名单）
+   *    TypeBox schema 结构校验（字段类型、enum 白名单）
    *   文本完整性（拼接 segments.text 逐字等于原文）
    *    Index 连续性（严格 0, 1, 2...）
    */
   async segment(text: string): Promise<LlmSegmentationOutput | null> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120_000);
+    const timeout = setTimeout(() => controller.abort(), config.DEEPSEEK_TIMEOUT_MS);
 
     try {
       const response = await fetch(`${this.base_url}`, {
@@ -161,6 +169,7 @@ export class LlmSegmentationClient {
             { role: 'user', content: text },
           ],
           stream: false,
+          thinking: { type: 'disabled' },
           response_format: SEGMENTATION_RESPONSE_FORMAT,
         }),
         signal: controller.signal,
@@ -184,14 +193,17 @@ export class LlmSegmentationClient {
         return null;
       }
 
-      // L5: Zod 结构校验
-      const parseResult = LlmSegmentationOutputSchema.safeParse(parsed);
-      if (!parseResult.success) {
-        logger.error(`[orchestrator] 分割输出 Zod 校验失败：${parseResult.error.message}`);
+      // L5: TypeBox 默认值应用与结构校验
+      const value = Default(LlmSegmentationOutputSchema, parsed);
+      if (!Check(LlmSegmentationOutputSchema, value)) {
+        const details = [...Errors(LlmSegmentationOutputSchema, value)]
+          .map((error) => `${error.instancePath || '/'}: ${error.message}`)
+          .join('; ');
+        logger.error(`[orchestrator] 分割输出 TypeBox 校验失败：${details}`);
         return null;
       }
 
-      const { segments, characters } = parseResult.data;
+      const { segments, characters } = value;
 
       // L6: 文本完整性 + Index 连续性
       if (!this.validateTextIntegrity(segments, text)) {
@@ -285,7 +297,8 @@ export class Orchestrator {
       const gender = genderOf.get(id);
       let voice: VoiceId = FALLBACK_VOICE;
       if (gender === '女性') {
-        voice = FEMALE_VOICES[this.globalCounters['女性']++ % FEMALE_VOICES.length] ?? FALLBACK_VOICE;
+        voice =
+          FEMALE_VOICES[this.globalCounters['女性']++ % FEMALE_VOICES.length] ?? FALLBACK_VOICE;
       } else if (gender === '男性') {
         voice = MALE_VOICES[this.globalCounters['男性']++ % MALE_VOICES.length] ?? FALLBACK_VOICE;
       }
@@ -295,7 +308,9 @@ export class Orchestrator {
     // 回填 segments：narrator 固定苏打，其余查全局映射表
     for (const s of segments) {
       s.voiceId =
-        s.speaker === 'narrator' ? NARRATOR_VOICE : (this.globalVoiceMap.get(s.speaker) ?? FALLBACK_VOICE);
+        s.speaker === 'narrator'
+          ? NARRATOR_VOICE
+          : (this.globalVoiceMap.get(s.speaker) ?? FALLBACK_VOICE);
     }
 
     // 重建 characters 表：去重、带规则化 voiceId 与原 gender
@@ -516,12 +531,12 @@ export class Orchestrator {
       `[Orchestrator] Handled output text. Reconstructed ${jobState.totalChunks} chunks.`,
     );
 
-    // 3. 执行 TTS 阶段
+    //  执行 TTS 阶段
     await this.runTtsPhase();
 
     if (this.ctx.isCanceled()) return;
 
-    // 4. 执行 Mux 混音阶段
+    //  执行 Mux 混音阶段
     await this.runMuxPhase(allNewChunks, jobDir);
 
     logger.info(`[Orchestrator] Finished run successfully.`);

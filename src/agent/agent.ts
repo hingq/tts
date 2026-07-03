@@ -48,7 +48,7 @@ class AgentCache {
       });
       this.agents.set(threadId, agent);
       this.threadOrder.push(threadId);
-      
+
       // 淘汰最早的会话
       if (this.threadOrder.length > this.maxThreads) {
         const evicted = this.threadOrder.shift()!;

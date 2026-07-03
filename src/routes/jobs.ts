@@ -479,8 +479,6 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
       return reply.code(409).send({ error: 'Conflict', message: '任务尚未完成' });
     }
 
-    // 已卸载到 COS：302 跳转到限时预签名 URL，客户端直连 COS 出口下载，绕开本机 5M。
-    // Range/断点续传由 COS 原生支持。未上传（remoteKey 为空）则落到下方本地流式逻辑兜底。
     const remoteKey = manager.getRemoteKey(jobId);
     if (remoteKey) {
       const url = await objectStore.getPresignedUrl(remoteKey, `${job.title || 'audiobook'}.m4b`);

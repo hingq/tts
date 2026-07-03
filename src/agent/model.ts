@@ -21,7 +21,7 @@ export function getChatModel(): Model<any> {
   }
 
   const providerId = config.AGENT_LLM_PROVIDER.toLowerCase();
-  
+
   // 对于支持 fallback 机制的自建模型或者 openai 兼容接口：
   // 如果是 deepseek 且我们要强制走它的端点，由于 pi-ai 自带了 deepseek provider，我们可以直接用
   const model = models.getModel(providerId, config.AGENT_LLM_MODEL);

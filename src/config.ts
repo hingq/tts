@@ -1,99 +1,151 @@
 import dotenv from 'dotenv';
-import { z } from 'zod';
+import { Type, type Static } from 'typebox';
+import { Check, Errors } from 'typebox/value';
 
 dotenv.config();
 
-const bool = (defaultValue: boolean) =>
-  z.preprocess((value) => {
-    if (value === undefined) return defaultValue;
-    if (typeof value === 'boolean') return value;
-    if (typeof value !== 'string') return defaultValue;
+export const EnvSchema = Type.Object({
+  NODE_ENV: Type.String(),
 
-    switch (value.toLowerCase()) {
-      case 'true':
-      case '1':
-      case 'yes':
-      case 'on':
-        return true;
+  PORT: Type.Number(),
+  HOST: Type.String(),
 
-      case 'false':
-      case '0':
-      case 'no':
-      case 'off':
-        return false;
+  TMP_ROOT: Type.String(),
 
-      default:
-        return defaultValue;
-    }
-  }, z.boolean());
+  MAX_TEXT_SIZE_MB: Type.Number(),
+  MAX_CONCURRENT_JOBS: Type.Number(),
+  CONCURRENT_TTS_LIMIT: Type.Number(),
+  CONCURRENT_TRANSCODE_LIMIT: Type.Number(),
 
-const number = (defaultValue: number) =>
-  z.preprocess((value) => {
-    if (value === undefined) return defaultValue;
+  DEFAULT_TTS_ENGINE: Type.String(),
+  EDGE_VOICE: Type.String(),
 
-    const n = Number(value);
-    return Number.isFinite(n) ? n : defaultValue;
-  }, z.number());
+  SUBPROCESS_TIMEOUT_MS: Type.Number(),
+  GLOBAL_TASK_TIMEOUT_MS: Type.Number(),
 
-const string = (defaultValue: string) =>
-  z.preprocess((value) => (value === undefined || value === '' ? defaultValue : value), z.string());
+  TTS_PROXY: Type.Optional(Type.String()),
 
-export const EnvSchema = z.object({
-  NODE_ENV: string('development'),
+  MIMO_API_KEY: Type.String(),
+  MIMO_BASE_URL: Type.String(),
+  MIMO_MODEL: Type.String(),
+  MIMO_VOICE: Type.String(),
+  MIMO_STYLE_PROMPT: Type.String(),
 
-  PORT: number(3000),
-  HOST: string('127.0.0.1'),
+  FFMPEG_PATH: Type.String(),
+  FFPROBE_PATH: Type.String(),
 
-  TMP_ROOT: string(''),
+  COS_SECRET_ID: Type.String(),
+  COS_SECRET_KEY: Type.String(),
+  COS_BUCKET: Type.String(),
+  COS_REGION: Type.String(),
+  COS_KEY_PREFIX: Type.String(),
+  COS_PRESIGN_TTL_S: Type.Number(),
 
-  MAX_TEXT_SIZE_MB: number(5),
-  MAX_CONCURRENT_JOBS: number(2),
-  CONCURRENT_TTS_LIMIT: number(3),
-  CONCURRENT_TRANSCODE_LIMIT: number(2),
+  COS_USE_INTERNAL_UPLOAD: Type.Boolean(),
+  COS_UPLOAD_ENABLED: Type.Boolean(),
 
-  DEFAULT_TTS_ENGINE: string('mimo-tts'),
-  EDGE_VOICE: string('zh-CN-YunxiNeural'),
+  LOG_VERBOSE: Type.Boolean(),
 
-  SUBPROCESS_TIMEOUT_MS: number(60_000),
-  GLOBAL_TASK_TIMEOUT_MS: number(3_600_000),
+  AGENT_ENABLED: Type.Boolean(),
+  AGENT_LLM_PROVIDER: Type.String(),
+  AGENT_LLM_MODEL: Type.String(),
+  AGENT_LLM_API_KEY: Type.String(),
+  AGENT_LLM_BASE_URL: Type.Optional(Type.String()),
+  AGENT_MAX_STEPS: Type.Number(),
 
-  TTS_PROXY: z.string().optional(),
+  ORCHESTRATOR_ENABLED: Type.Boolean(),
 
-  MIMO_API_KEY: string(''),
-  MIMO_BASE_URL: string('https://api.xiaomimimo.com/v1'),
-  MIMO_MODEL: string('mimo-v2.5-tts'),
-  MIMO_VOICE: string('苏打'),
-  MIMO_STYLE_PROMPT: string('平稳、自然、清晰的旁白朗读语气'),
-
-  FFMPEG_PATH: string('ffmpeg'),
-  FFPROBE_PATH: string('ffprobe'),
-
-  COS_SECRET_ID: string(''),
-  COS_SECRET_KEY: string(''),
-  COS_BUCKET: string(''),
-  COS_REGION: string(''),
-  COS_KEY_PREFIX: string('audiobooks/'),
-  COS_PRESIGN_TTL_S: number(3600),
-
-  COS_USE_INTERNAL_UPLOAD: bool(true),
-  COS_UPLOAD_ENABLED: bool(false),
-
-  LOG_VERBOSE: bool(false),
-
-  AGENT_ENABLED: bool(false),
-  AGENT_LLM_PROVIDER: string('anthropic'),
-  AGENT_LLM_MODEL: string(''),
-  AGENT_LLM_API_KEY: string(''),
-  AGENT_LLM_BASE_URL: z.string().optional(),
-  AGENT_MAX_STEPS: number(8),
-
-  ORCHESTRATOR_ENABLED: bool(false),
-
-  DEEPSEEK_MODEL: string('deepseek-v4-flash'),
-  DEEPSEEK_API_KEY: string(''),
-  DEEPSEEK_BASE_URL: string('https://api.deepseek.com/v1'),
+  DEEPSEEK_MODEL: Type.String(),
+  DEEPSEEK_API_KEY: Type.String(),
+  DEEPSEEK_BASE_URL: Type.String(),
+  DEEPSEEK_TIMEOUT_MS: Type.Number(),
 });
 
-export const config = EnvSchema.parse(process.env);
+export type Config = Static<typeof EnvSchema>;
 
-export type Config = z.infer<typeof EnvSchema>;
+function booleanValue(value: unknown, defaultValue: boolean): boolean {
+  if (value === undefined) return defaultValue;
+  if (typeof value === 'boolean') return value;
+  if (typeof value !== 'string') return defaultValue;
+
+  switch (value.toLowerCase()) {
+    case 'true':
+    case '1':
+    case 'yes':
+    case 'on':
+      return true;
+    case 'false':
+    case '0':
+    case 'no':
+    case 'off':
+      return false;
+    default:
+      return defaultValue;
+  }
+}
+
+function numberValue(value: unknown, defaultValue: number): number {
+  if (value === undefined) return defaultValue;
+  const converted = Number(value);
+  return Number.isFinite(converted) ? converted : defaultValue;
+}
+
+function stringValue(value: unknown, defaultValue: string): unknown {
+  return value === undefined || value === '' ? defaultValue : value;
+}
+
+export function parseEnv(env: Record<string, unknown>): Config {
+  const candidate = {
+    NODE_ENV: stringValue(env.NODE_ENV, 'development'),
+    PORT: numberValue(env.PORT, 3000),
+    HOST: stringValue(env.HOST, '127.0.0.1'),
+    TMP_ROOT: stringValue(env.TMP_ROOT, ''),
+    MAX_TEXT_SIZE_MB: numberValue(env.MAX_TEXT_SIZE_MB, 5),
+    MAX_CONCURRENT_JOBS: numberValue(env.MAX_CONCURRENT_JOBS, 2),
+    CONCURRENT_TTS_LIMIT: numberValue(env.CONCURRENT_TTS_LIMIT, 3),
+    CONCURRENT_TRANSCODE_LIMIT: numberValue(env.CONCURRENT_TRANSCODE_LIMIT, 2),
+    DEFAULT_TTS_ENGINE: stringValue(env.DEFAULT_TTS_ENGINE, 'mimo-tts'),
+    EDGE_VOICE: stringValue(env.EDGE_VOICE, 'zh-CN-YunxiNeural'),
+    SUBPROCESS_TIMEOUT_MS: numberValue(env.SUBPROCESS_TIMEOUT_MS, 60_000),
+    GLOBAL_TASK_TIMEOUT_MS: numberValue(env.GLOBAL_TASK_TIMEOUT_MS, 3_600_000),
+    ...(env.TTS_PROXY === undefined ? {} : { TTS_PROXY: env.TTS_PROXY }),
+    MIMO_API_KEY: stringValue(env.MIMO_API_KEY, ''),
+    MIMO_BASE_URL: stringValue(env.MIMO_BASE_URL, 'https://api.xiaomimimo.com/v1'),
+    MIMO_MODEL: stringValue(env.MIMO_MODEL, 'mimo-v2.5-tts'),
+    MIMO_VOICE: stringValue(env.MIMO_VOICE, '苏打'),
+    MIMO_STYLE_PROMPT: stringValue(env.MIMO_STYLE_PROMPT, '平稳、自然、清晰的旁白朗读语气'),
+    FFMPEG_PATH: stringValue(env.FFMPEG_PATH, 'ffmpeg'),
+    FFPROBE_PATH: stringValue(env.FFPROBE_PATH, 'ffprobe'),
+    COS_SECRET_ID: stringValue(env.COS_SECRET_ID, ''),
+    COS_SECRET_KEY: stringValue(env.COS_SECRET_KEY, ''),
+    COS_BUCKET: stringValue(env.COS_BUCKET, ''),
+    COS_REGION: stringValue(env.COS_REGION, ''),
+    COS_KEY_PREFIX: stringValue(env.COS_KEY_PREFIX, 'audiobooks/'),
+    COS_PRESIGN_TTL_S: numberValue(env.COS_PRESIGN_TTL_S, 3600),
+    COS_USE_INTERNAL_UPLOAD: booleanValue(env.COS_USE_INTERNAL_UPLOAD, true),
+    COS_UPLOAD_ENABLED: booleanValue(env.COS_UPLOAD_ENABLED, false),
+    LOG_VERBOSE: booleanValue(env.LOG_VERBOSE, false),
+    AGENT_ENABLED: booleanValue(env.AGENT_ENABLED, false),
+    AGENT_LLM_PROVIDER: stringValue(env.AGENT_LLM_PROVIDER, 'anthropic'),
+    AGENT_LLM_MODEL: stringValue(env.AGENT_LLM_MODEL, ''),
+    AGENT_LLM_API_KEY: stringValue(env.AGENT_LLM_API_KEY, ''),
+    ...(env.AGENT_LLM_BASE_URL === undefined ? {} : { AGENT_LLM_BASE_URL: env.AGENT_LLM_BASE_URL }),
+    AGENT_MAX_STEPS: numberValue(env.AGENT_MAX_STEPS, 8),
+    ORCHESTRATOR_ENABLED: booleanValue(env.ORCHESTRATOR_ENABLED, false),
+    DEEPSEEK_MODEL: stringValue(env.DEEPSEEK_MODEL, 'deepseek-v4-flash'),
+    DEEPSEEK_API_KEY: stringValue(env.DEEPSEEK_API_KEY, ''),
+    DEEPSEEK_BASE_URL: stringValue(env.DEEPSEEK_BASE_URL, 'https://api.deepseek.com/v1'),
+    DEEPSEEK_TIMEOUT_MS: numberValue(env.DEEPSEEK_TIMEOUT_MS, 300_000),
+  };
+
+  if (!Check(EnvSchema, candidate)) {
+    const details = [...Errors(EnvSchema, candidate)]
+      .map((error) => `${error.instancePath || '/'}: ${error.message}`)
+      .join('; ');
+    throw new Error(`Invalid environment configuration: ${details}`);
+  }
+
+  return candidate;
+}
+
+export const config = parseEnv(process.env);
