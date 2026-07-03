@@ -7,13 +7,6 @@
 import { build } from 'esbuild';
 import { glob } from 'node:fs/promises';
 import fs from 'node:fs';
-// 收集 src/ 下所有 .ts 入口（排除 .d.ts 声明文件）
-// const entryPoints = [];
-// for await (const file of glob('src/**/*.ts')) {
-//   if (!file.endsWith('.d.ts')) {
-//     entryPoints.push(file);
-//   }
-// }
 fs.rmSync('dist', { recursive: true, force: true });
 await build({
   entryPoints: ['src/server.ts'],
