@@ -13,10 +13,10 @@ export const models = builtinModels();
  * 获取 pi-ai 支持的模型实例。
  */
 export function getChatModel(): Model<any> {
-  if (!config.AGENT_LLM_API_KEY) {
+  if (!config.DEEPSEEK_API_KEY) {
     throw new Error('AGENT_LLM_API_KEY 未配置，无法初始化 Agent 模型');
   }
-  if (!config.AGENT_LLM_MODEL) {
+  if (!config.DEEPSEEK_MODEL) {
     throw new Error('AGENT_LLM_MODEL 未配置，无法初始化 Agent 模型');
   }
 

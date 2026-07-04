@@ -37,8 +37,6 @@ const LlmSegmentSchema = Type.Object({
   index: Type.Integer({ minimum: 0 }),
   text: Type.String({ minLength: 1 }),
   speaker: Type.String({ minLength: 1 }),
-  // voiceId 由下游 assignVoices 规则统一分配；LLM 可不填，填了也会被覆盖
-  voiceId: Type.Optional(VoiceIdSchema),
   emotion: Type.String({ minLength: 1, default: 'neutral' }),
   speedModifier: Type.Number({ exclusiveMinimum: 0, default: 1 }),
 });
@@ -48,7 +46,6 @@ const LlmSegmentationOutputSchema = Type.Object({
   characters: Type.Array(
     Type.Object({
       id: Type.String({ minLength: 1 }),
-      // voiceId 同样由下游规则分配，LLM 只需保证 gender 准确
       voiceId: Type.Optional(VoiceIdSchema),
       gender: Type.Optional(Type.String()),
     }),
@@ -57,7 +54,65 @@ const LlmSegmentationOutputSchema = Type.Object({
 });
 
 type LlmSegmentationOutput = Static<typeof LlmSegmentationOutputSchema>;
-type LlmSegment = Static<typeof LlmSegmentSchema>;
+type LlmSegment = Static<typeof LlmSegmentSchema> & { voiceId?: VoiceId };
+
+const INTEGRITY_CONTEXT_RADIUS = 20;
+
+interface NormalizedText {
+  rawCharacters: string[];
+  characters: string[];
+  rawIndexes: number[];
+}
+
+function normalizeTextForIntegrity(text: string): NormalizedText {
+  const rawCharacters = Array.from(text);
+  const characters: string[] = [];
+  const rawIndexes: number[] = [];
+
+  rawCharacters.forEach((character, rawIndex) => {
+    if (/\s/u.test(character)) return;
+    characters.push(character);
+    rawIndexes.push(rawIndex);
+  });
+
+  return { rawCharacters, characters, rawIndexes };
+}
+
+function escapeLogText(text: string): string {
+  return Array.from(text)
+    .map((character) => {
+      if (character === '\\') return '\\\\';
+      if (character === '"') return '\\"';
+      if (character === '\n') return '\\n';
+      if (character === '\r') return '\\r';
+      if (character === '\t') return '\\t';
+
+      const codePoint = character.codePointAt(0)!;
+      if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) {
+        return `\\u${codePoint.toString(16).padStart(4, '0')}`;
+      }
+      return character;
+    })
+    .join('');
+}
+
+function formatLogText(text: string): string {
+  return `"${escapeLogText(text)}"`;
+}
+
+function formatDifferenceCharacter(character: string | undefined): string {
+  return character === undefined ? '<EOF>' : formatLogText(character);
+}
+
+function contextAtNormalizedIndex(text: NormalizedText, normalizedIndex: number): string {
+  const rawIndex = text.rawIndexes[normalizedIndex] ?? text.rawCharacters.length;
+  const start = Math.max(0, rawIndex - INTEGRITY_CONTEXT_RADIUS);
+  const end =
+    rawIndex < text.rawCharacters.length
+      ? Math.min(text.rawCharacters.length, rawIndex + INTEGRITY_CONTEXT_RADIUS + 1)
+      : text.rawCharacters.length;
+  return text.rawCharacters.slice(start, end).join('');
+}
 
 // ─── LlmSegmentationClient ────────────────────────────────────────────
 type LlmClientConfig = {
@@ -85,10 +140,12 @@ const prompt = `
     （如无名路人的只言片语）才归 narrator，不要臆造角色名。
   - 同一角色在全章、全书必须用完全一致的名字字符串（如统一「郭襄」，不要时而「郭襄」时而「郭二小姐」）。
 
-  【音色 voiceId】——你不需要、也不应该自行决定 voiceId，它由下游按规则统一分配。
-  你唯一要做的是在【角色表 characters】里准确填写每个角色的 gender（男性/女性）。
-  下游规则：narrator→苏打；女性按出现顺序在「冰糖 / 茉莉」轮询；男性按出现顺序在「苏打 / 白桦」轮询；
-  gender 缺失→mimo_default。segments 里的 voiceId 字段可留空，填了也会被覆盖，请把精力放在 speaker 与 gender 上。
+  【音色 voiceId】
+  - 你必须在 characters 中为每个角色选择一个可用音色；segments 中不要输出 voiceId。
+  - narrator 固定使用「苏打」，且不进入 characters。
+  - 女性只能选择「冰糖」或「茉莉」；男性只能选择「苏打」或「白桦」；性别无法判断时选择「mimo_default」。
+  - 输入会附带“已锁定角色音色”。其中已有的角色必须严格沿用给定音色，不得重新选择。
+  - 同一角色在本章 characters 中只出现一次，且 voiceId 必须是上述五个值之一。
 
   【情绪 emotion】
   - 取值：neutral / calm / happy / excited / sad / angry / whisper。
@@ -100,7 +157,8 @@ const prompt = `
 
   【角色表 characters】
   - 列出本章所有非 narrator 的角色（去重），id 必须与对应 segments 的 speaker 完全一致。
-  - gender 必填「男性」或「女性」——音色分配完全依赖此字段，务必准确，拿不准时按名字与剧情常识判断。
+  - gender 填「男性」或「女性」；确实无法判断时可省略，并将 voiceId 设为「mimo_default」。
+  - voiceId 必填，并遵守音色规则及输入中的已锁定角色音色。
   - narrator 不进 characters 表。
 
   【输出顺序与编号】
@@ -128,10 +186,36 @@ export class LlmSegmentationClient {
    * 文本完整性校验：所有 segments[].text 拼接后必须逐字等于原文。
    * 这是有声书制作的核心约束——漏字会导致音频缺失、字数对不上。
    */
-  private validateTextIntegrity(segments: { text: string }[], originalText: string): boolean {
+  private validateTextIntegrity(
+    segments: { text: string }[],
+    originalText: string,
+  ): { valid: true } | { valid: false; diagnostic: string } {
     const reconstructed = segments.map((s) => s.text).join('');
-    const norm = (s: string) => s.replace(/\s+/g, '');
-    return norm(reconstructed) === norm(originalText);
+    const original = normalizeTextForIntegrity(originalText);
+    const output = normalizeTextForIntegrity(reconstructed);
+    const comparisonLength = Math.max(original.characters.length, output.characters.length);
+    let firstDifference = -1;
+
+    for (let index = 0; index < comparisonLength; index += 1) {
+      if (original.characters[index] !== output.characters[index]) {
+        firstDifference = index;
+        break;
+      }
+    }
+
+    if (firstDifference === -1) return { valid: true };
+
+    const diagnostic = [
+      `原文长度=${original.rawCharacters.length}，输出长度=${output.rawCharacters.length}`,
+      `去空白原文长度=${original.characters.length}，去空白输出长度=${output.characters.length}`,
+      `首个差异位置=${firstDifference}`,
+      `原文差异字符=${formatDifferenceCharacter(original.characters[firstDifference])}`,
+      `输出差异字符=${formatDifferenceCharacter(output.characters[firstDifference])}`,
+      `原文片段=${formatLogText(contextAtNormalizedIndex(original, firstDifference))}`,
+      `输出片段=${formatLogText(contextAtNormalizedIndex(output, firstDifference))}`,
+    ].join('；');
+
+    return { valid: false, diagnostic };
   }
 
   /**
@@ -151,7 +235,10 @@ export class LlmSegmentationClient {
    *   文本完整性（拼接 segments.text 逐字等于原文）
    *    Index 连续性（严格 0, 1, 2...）
    */
-  async segment(text: string): Promise<LlmSegmentationOutput | null> {
+  async segment(
+    text: string,
+    lockedVoices: ReadonlyMap<string, string> = new Map(),
+  ): Promise<LlmSegmentationOutput | null> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), config.DEEPSEEK_TIMEOUT_MS);
 
@@ -166,7 +253,10 @@ export class LlmSegmentationClient {
           model: this.model,
           messages: [
             { role: 'system', content: this.system_prompt },
-            { role: 'user', content: text },
+            {
+              role: 'user',
+              content: `已锁定角色音色：${JSON.stringify(Object.fromEntries(lockedVoices))}\n原文：\n${text}`,
+            },
           ],
           stream: false,
           thinking: { type: 'disabled' },
@@ -206,8 +296,9 @@ export class LlmSegmentationClient {
       const { segments, characters } = value;
 
       // L6: 文本完整性 + Index 连续性
-      if (!this.validateTextIntegrity(segments, text)) {
-        logger.error('[orchestrator] 分割输出文本完整性校验失败');
+      const integrity = this.validateTextIntegrity(segments, text);
+      if (!integrity.valid) {
+        logger.error(`[orchestrator] 分割输出文本完整性校验失败：${integrity.diagnostic}`);
         return null;
       }
       if (!this.validateIndexContinuity(segments)) {
@@ -269,17 +360,18 @@ export class Orchestrator {
   /**
    * 规则化分配音色：
    *  - narrator → 苏打
-   *  - 角色按 gender 在同性音色池里按 segments 首现顺序轮询（女→冰糖/茉莉，男→苏打/白桦）
-   *  - gender 缺失/未知 → mimo_default
-   * 由本函数统一决定 voiceId，保证同一角色在本章及全书稳定、同性别的不同角色尽量区分，
-   * 彻底避免「同角色音色漂移」与「LLM 随机挑音色」两类问题。
+   *  - 新角色采用 LLM 在对应性别音色池中的选择
+   *  - 已出现角色始终复用首次锁定音色
+   *  - 缺失/不匹配的选择按性别池确定性补选，未知 gender → mimo_default
    * 返回重建后的 characters 表（voiceId 已规则化）。
    */
   private assignVoices(
     segments: { speaker: string; voiceId?: string }[],
-    characters: { id: string; gender?: string }[],
+    characters: { id: string; voiceId?: VoiceId; gender?: string }[],
+    chapterIndex: number,
   ): { id: string; voiceId: VoiceId; gender?: string }[] {
     const genderOf = new Map(characters.map((c) => [c.id, c.gender]));
+    const modelVoiceOf = new Map(characters.map((c) => [c.id, c.voiceId]));
 
     // 按 segments 首现顺序收集去重角色（保证全书只要角色识别一致，音色就稳定）
     const order: string[] = [];
@@ -290,17 +382,44 @@ export class Orchestrator {
       order.push(s.speaker);
     }
 
-    // 为本章每个新角色派生并记录稳定 voiceId，已分配过的直接复用以解决音色漂移问题
+    // 新角色接受模型的合法选择并锁定；老角色忽略模型冲突，保证全书一致。
     for (const id of order) {
-      if (this.globalVoiceMap.has(id)) continue;
+      const lockedVoice = this.globalVoiceMap.get(id);
+      const modelVoice = modelVoiceOf.get(id);
+      if (lockedVoice) {
+        if (modelVoice && modelVoice !== lockedVoice) {
+          logger.info(
+            `[Orchestrator] WARNING: Chapter ${chapterIndex} character "${id}" requested voice "${modelVoice}", keeping locked voice "${lockedVoice}".`,
+          );
+        }
+        continue;
+      }
 
       const gender = genderOf.get(id);
       let voice: VoiceId = FALLBACK_VOICE;
+      let repaired = false;
       if (gender === '女性') {
-        voice =
-          FEMALE_VOICES[this.globalCounters['女性']++ % FEMALE_VOICES.length] ?? FALLBACK_VOICE;
+        if (modelVoice && FEMALE_VOICES.includes(modelVoice)) {
+          voice = modelVoice;
+        } else {
+          voice =
+            FEMALE_VOICES[this.globalCounters['女性']++ % FEMALE_VOICES.length] ?? FALLBACK_VOICE;
+          repaired = true;
+        }
       } else if (gender === '男性') {
-        voice = MALE_VOICES[this.globalCounters['男性']++ % MALE_VOICES.length] ?? FALLBACK_VOICE;
+        if (modelVoice && MALE_VOICES.includes(modelVoice)) {
+          voice = modelVoice;
+        } else {
+          voice = MALE_VOICES[this.globalCounters['男性']++ % MALE_VOICES.length] ?? FALLBACK_VOICE;
+          repaired = true;
+        }
+      } else if (modelVoice !== FALLBACK_VOICE) {
+        repaired = true;
+      }
+      if (repaired) {
+        logger.info(
+          `[Orchestrator] WARNING: Chapter ${chapterIndex} character "${id}" has missing or incompatible voice "${modelVoice ?? ''}" for gender "${gender ?? 'unknown'}"; using "${voice}".`,
+        );
       }
       this.globalVoiceMap.set(id, voice);
     }
@@ -383,14 +502,14 @@ export class Orchestrator {
     }
 
     logger.info(`[Orchestrator] Calling DeepSeek LLM for chapter ${chapterIndex}...`);
-    const llmResult = await this.segmentationClient.segment(chapterText);
+    const llmResult = await this.segmentationClient.segment(chapterText, this.globalVoiceMap);
 
     if (llmResult && llmResult.segments && llmResult.segments.length > 0) {
       logger.info(
         `[Orchestrator] LLM segmentation succeeded with ${llmResult.segments.length} segments.`,
       );
       // 在 Orchestrator 内部运行业务分配规则与钳位
-      this.assignVoices(llmResult.segments, llmResult.characters);
+      this.assignVoices(llmResult.segments, llmResult.characters, chapterIndex);
       this.clampSpeedModifier(llmResult.segments);
       return llmResult.segments;
     }
