@@ -31,12 +31,8 @@ class AgentCache {
     let agent = this.agents.get(threadId);
     if (!agent) {
       agent = new Agent({
-        getApiKey: async (providerId) => {
-          // 强制使用系统配置中的 API Key，不依赖进程环境变量
-          if (providerId === config.AGENT_LLM_PROVIDER.toLowerCase()) {
-            return { auth: { apiKey: config.AGENT_LLM_API_KEY } } as any;
-          }
-          return undefined;
+        getApiKey: async () => {
+          return { auth: { apiKey: config.DEEPSEEK_API_KEY } };
         },
         initialState: {
           systemPrompt: SYSTEM_PROMPT,

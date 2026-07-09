@@ -46,7 +46,6 @@ export const EnvSchema = Type.Object({
 
   LOG_VERBOSE: Type.Boolean(),
 
-  AGENT_ENABLED: Type.Boolean(),
   AGENT_LLM_PROVIDER: Type.String(),
   AGENT_LLM_MODEL: Type.String(),
   AGENT_LLM_API_KEY: Type.String(),
@@ -125,9 +124,8 @@ export function parseEnv(env: Record<string, unknown>): Config {
     COS_USE_INTERNAL_UPLOAD: booleanValue(env.COS_USE_INTERNAL_UPLOAD, true),
     COS_UPLOAD_ENABLED: booleanValue(env.COS_UPLOAD_ENABLED, false),
     LOG_VERBOSE: booleanValue(env.LOG_VERBOSE, false),
-    AGENT_ENABLED: booleanValue(env.AGENT_ENABLED, false),
-    AGENT_LLM_PROVIDER: stringValue(env.AGENT_LLM_PROVIDER, 'anthropic'),
-    AGENT_LLM_MODEL: stringValue(env.AGENT_LLM_MODEL, ''),
+    AGENT_LLM_PROVIDER: stringValue(env.AGENT_LLM_PROVIDER, 'deepseek'),
+    AGENT_LLM_MODEL: stringValue(env.AGENT_LLM_MODEL, 'deepseek-v4-flash'),
     AGENT_LLM_API_KEY: stringValue(env.AGENT_LLM_API_KEY, ''),
     ...(env.AGENT_LLM_BASE_URL === undefined ? {} : { AGENT_LLM_BASE_URL: env.AGENT_LLM_BASE_URL }),
     AGENT_MAX_STEPS: numberValue(env.AGENT_MAX_STEPS, 8),

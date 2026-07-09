@@ -390,84 +390,81 @@ export async function registerRoutes(fastify: FastifyInstance): Promise<void> {
     manager.on(`job:${jobId}`, listener);
     request.raw.on('close', cleanup);
   });
-  // 对话式 Agent 路由：仅在 AGENT_ENABLED 时挂载，关闭则完全不存在，不影响 TTS 主链路。
-  if (config.AGENT_ENABLED) {
-    fastify.post('/agent/chat', async (request, reply) => {
-      const body = (request.body ?? {}) as { message?: unknown; threadId?: unknown };
-      const message = typeof body.message === 'string' ? body.message.trim() : '';
-      if (!message) {
-        return reply.code(400).send({ error: 'Bad Request', message: 'message 不能为空' });
-      }
-      // threadId 用于 LangGraph 多轮会话隔离；未提供则新建一轮会话。
-      const threadId =
-        typeof body.threadId === 'string' && body.threadId ? body.threadId : randomUUID();
+  fastify.post('/agent/chat', async (request, reply) => {
+    const body = (request.body ?? {}) as { message?: unknown; threadId?: unknown };
+    const message = typeof body.message === 'string' ? body.message.trim() : '';
+    if (!message) {
+      return reply.code(400).send({ error: 'Bad Request', message: 'message 不能为空' });
+    }
+    // threadId 用于 LangGraph 多轮会话隔离；未提供则新建一轮会话。
+    const threadId =
+      typeof body.threadId === 'string' && body.threadId ? body.threadId : randomUUID();
 
-      let agent: ReturnType<typeof getAgent>;
-      try {
-        agent = getAgent(threadId);
-      } catch (err) {
-        // 缺 key / provider 不支持等配置问题：明确 503，避免吞错。
-        return reply.code(503).send({
-          error: 'Service Unavailable',
-          message: `Agent 未正确配置：${(err as Error).message}`,
+    let agent: ReturnType<typeof getAgent>;
+    try {
+      agent = getAgent(threadId);
+    } catch (err) {
+      // 缺 key / provider 不支持等配置问题：明确 503，避免吞错。
+      return reply.code(503).send({
+        error: 'Service Unavailable',
+        message: `Agent 未正确配置：${(err as Error).message}`,
+      });
+    }
+
+    reply.sse({ event: 'handshake', data: JSON.stringify({ threadId }) });
+
+    let cleaned = false;
+    const heartbeat = setInterval(() => reply.sse({ comment: 'keepalive' }), 20_000);
+
+    const unsubscribe = agent.subscribe((event) => {
+      if (cleaned) return;
+      if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') {
+        reply.sse({ event: 'ai-stream', data: escapeSseText(event.assistantMessageEvent.delta) });
+      } else if (event.type === 'tool_execution_start') {
+        reply.sse({
+          event: 'tool-call',
+          data: JSON.stringify({ name: event.toolName, input: event.args }),
+        });
+      } else if (event.type === 'tool_execution_end') {
+        // 提取文本内容或者直接返回序列化的 result
+        const contentArray = (event.result as any)?.content;
+        const textContent = Array.isArray(contentArray)
+          ? contentArray.find((c: any) => c.type === 'text')?.text
+          : undefined;
+        reply.sse({
+          event: 'tool-result',
+          data: JSON.stringify({
+            name: event.toolName,
+            output: textContent || JSON.stringify(event.result),
+          }),
         });
       }
-
-      reply.sse({ event: 'handshake', data: JSON.stringify({ threadId }) });
-
-      let cleaned = false;
-      const heartbeat = setInterval(() => reply.sse({ comment: 'keepalive' }), 20_000);
-
-      const unsubscribe = agent.subscribe((event) => {
-        if (cleaned) return;
-        if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') {
-          reply.sse({ event: 'ai-stream', data: escapeSseText(event.assistantMessageEvent.delta) });
-        } else if (event.type === 'tool_execution_start') {
-          reply.sse({
-            event: 'tool-call',
-            data: JSON.stringify({ name: event.toolName, input: event.args }),
-          });
-        } else if (event.type === 'tool_execution_end') {
-          // 提取文本内容或者直接返回序列化的 result
-          const contentArray = (event.result as any)?.content;
-          const textContent = Array.isArray(contentArray)
-            ? contentArray.find((c: any) => c.type === 'text')?.text
-            : undefined;
-          reply.sse({
-            event: 'tool-result',
-            data: JSON.stringify({
-              name: event.toolName,
-              output: textContent || JSON.stringify(event.result),
-            }),
-          });
-        }
-      });
-
-      const cleanup = (): void => {
-        if (cleaned) return;
-        cleaned = true;
-        clearInterval(heartbeat);
-        agent.abort(); // 触发中止信号，停止当前 turn 的 LLM 及工具执行
-        unsubscribe();
-        reply.sseContext.source.end();
-      };
-      request.raw.on('close', cleanup);
-
-      try {
-        await agent.prompt(message);
-        if (!cleaned) reply.sse({ event: 'ai-complete', data: 'done' });
-      } catch (err) {
-        if (!cleaned) {
-          reply.sse({
-            event: 'ai-error',
-            data: JSON.stringify({ message: (err as Error).message }),
-          });
-        }
-      } finally {
-        cleanup();
-      }
     });
-  }
+
+    const cleanup = (): void => {
+      if (cleaned) return;
+      cleaned = true;
+      clearInterval(heartbeat);
+      agent.abort(); // 触发中止信号，停止当前 turn 的 LLM 及工具执行
+      unsubscribe();
+      reply.sseContext.source.end();
+    };
+    request.raw.on('close', cleanup);
+
+    try {
+      await agent.prompt(message);
+      if (!cleaned) reply.sse({ event: 'ai-complete', data: 'done' });
+    } catch (err) {
+      if (!cleaned) {
+        reply.sse({
+          event: 'ai-error',
+          data: JSON.stringify({ message: (err as Error).message }),
+        });
+      }
+    } finally {
+      cleanup();
+    }
+  });
   /** 带 Range 的文件下载；下载完成后异步清理工作目录。 */
   fastify.get('/jobs/:jobId/file', async (request, reply) => {
     const { jobId } = request.params as { jobId: string };

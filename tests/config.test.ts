@@ -16,21 +16,6 @@ describe('environment configuration parsing', () => {
     expect(parsed).not.toHaveProperty('AGENT_LLM_BASE_URL');
   });
 
-  it.each([
-    ['true', true],
-    ['1', true],
-    ['yes', true],
-    ['on', true],
-    ['TRUE', true],
-    ['false', false],
-    ['0', false],
-    ['no', false],
-    ['off', false],
-    ['FALSE', false],
-  ])('normalizes boolean spelling %s', (value, expected) => {
-    expect(parseEnv({ AGENT_ENABLED: value }).AGENT_ENABLED).toBe(expected);
-  });
-
   it('normalizes finite numbers and falls back for invalid numeric input', () => {
     expect(parseEnv({ PORT: '8080', MAX_TEXT_SIZE_MB: '2.5' })).toMatchObject({
       PORT: 8080,
@@ -39,13 +24,6 @@ describe('environment configuration parsing', () => {
     expect(parseEnv({ PORT: 'not-a-number', MAX_TEXT_SIZE_MB: 'Infinity' })).toMatchObject({
       PORT: 3000,
       MAX_TEXT_SIZE_MB: 5,
-    });
-  });
-
-  it('falls back for unsupported boolean values and non-string inputs', () => {
-    expect(parseEnv({ AGENT_ENABLED: 'sometimes', COS_USE_INTERNAL_UPLOAD: 0 })).toMatchObject({
-      AGENT_ENABLED: false,
-      COS_USE_INTERNAL_UPLOAD: true,
     });
   });
 

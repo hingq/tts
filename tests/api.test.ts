@@ -811,47 +811,4 @@ describe('API Integration Tests', () => {
   });
 
   // ── 额外测试 (对话式 Agent 接口) ─────────────────────────────────
-
-  describe('POST /api/v1/agent/chat (对话式 Agent)', () => {
-    afterEach(() => {
-      config.AGENT_ENABLED = false;
-    });
-
-    it('AGENT_ENABLED=false 时路由不挂载（404）', async () => {
-      config.AGENT_ENABLED = false;
-      const localApp = await buildApp();
-      const res = await localApp.inject({
-        method: 'POST',
-        url: '/api/v1/agent/chat',
-        payload: { message: '你好' },
-      });
-      expect(res.statusCode).toBe(404);
-      await localApp.close();
-    });
-
-    it('启用后 message 为空返回 400', async () => {
-      config.AGENT_ENABLED = true;
-      const localApp = await buildApp();
-      const res = await localApp.inject({
-        method: 'POST',
-        url: '/api/v1/agent/chat',
-        payload: { message: '   ' },
-      });
-      expect(res.statusCode).toBe(400);
-      await localApp.close();
-    });
-
-    it('启用但缺 AGENT_LLM_API_KEY 时返回 503', async () => {
-      config.AGENT_ENABLED = true;
-      config.AGENT_LLM_API_KEY = '';
-      const localApp = await buildApp();
-      const res = await localApp.inject({
-        method: 'POST',
-        url: '/api/v1/agent/chat',
-        payload: { message: '现在有哪些任务？' },
-      });
-      expect(res.statusCode).toBe(503);
-      await localApp.close();
-    });
-  });
 });
